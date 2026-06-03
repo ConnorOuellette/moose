@@ -93,84 +93,93 @@ DualMeshGenerator::generate()
     dualMesh->add_point(centroids[i]);
   }
 
+  std::unordered_map<dof_id_type, std::vector<dof_id_type>> _elem_to_node_map;
+  for (const auto & [node_id, elements] : _node_to_elem_map)
+  {
+    for (dof_id_type elem_id : elements)
+    {
+      _elem_to_node_map[elem_id].push_back(node_id);
+    }
+  } //_elem_to_node_map now has element IDs in the first entry and maps to the nodes that make
+    // up that element
+
+  // _____GETTING BOUNDARY NODES______ //
+  std::vector<libMesh::Point> extDualNodes;
+  // loop over all element IDs
+  for (const auto & [elemID, nodeIDs] : _elem_to_node_map)
+  {
+    Elem * primalElem = mesh->elem_ptr(elemID);
+    for (unsigned int i = 0; i < primalElem->n_neighbors(); ++i)
+    {
+      auto ext_neighbor = primalElem->neighbor_ptr(i);
+      if (ext_neighbor == nullptr)
+      {
+        _console << "OH NO!! " << std::endl;
+        std::vector<libMesh::Point> extPrimalNodes;
+        // This means the side to which this neighbor is is exterior.
+        for (const auto & extPrimalNode : primalElem->nodes_on_side(
+                 primalElem->which_side_am_i(ext_neighbor))) //"for the nodes on this side"
+        {
+          extPrimalNodes.push_back(extPrimalNode);
+        }
+        // find midpoint.
+        Point extDualNode = (extPrimalNodes[0] + extPrimalNodes[1]) / 2;
+        extDualNodes.push_back(extDualNode);
+        // Store these midpoints in ext_nodes
+      }
+      else
+        _console << "Howdy neighbor" << std::endl;
+    }
+    _console << "Next Element!" << std::endl;
+  }
+
   _console << "Mesh populated with dual nodes" << std::endl;
 
   // loop over all primal nodes / dual elements
   for (const auto & [primalNodeID, primalElemIDs] : _node_to_elem_map)
   {
     _console << "Number of nodes for dual element: " << primalElemIDs.size() << std::endl;
-    if (primalElemIDs.size() < 3)
+    if (primalElemIDs.size() >= 3)
     {
-      _console << "Found boundadry polygon with " << primalElemIDs.size() << " dual node(s)"
-               << std::endl;
 
-      std::unordered_map<dof_id_type, std::vector<dof_id_type>> _elem_to_node_map;
-
-      for (const auto & [node_id, elements] : _node_to_elem_map)
-      {
-        for (dof_id_type elem_id : elements)
-        {
-          _elem_to_node_map[elem_id].push_back(node_id);
-        }
-      } //_elem_to_node_map now has element IDs in the first entry and maps to the nodes that make
-        // up that element
-
-      // loop over all element IDs
-      for (const auto & [elemID, nodeIDs] : _elem_to_node_map)
-      {
-        Elem * primalElem = mesh->elem_ptr(elemID);
-        for (unsigned int i = 0; i < primalElem->n_neighbors(); ++i)
-        {
-          if (primalElem->neighbor_ptr(i) == nullptr)
-          {
-            _console << "OH NO!! " << std::endl;
-          }
-          else
-            _console << "Howdy neighbor" << std::endl;
-        }
-      }
-
-      //
-      continue;
-    }
-    else
       _console << "Loading interor polygon!" << std::endl;
 
-    // Define a dual element located at each primal node
-    std::unique_ptr<Elem> dualElem = std::make_unique<libMesh::C0Polygon>(primalElemIDs.size());
+      // Define a dual element located at each primal node
+      std::unique_ptr<Elem> dualElem = std::make_unique<libMesh::C0Polygon>(primalElemIDs.size());
 
-    // Now loop over the # of nodes on each dual element
-    std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
-    auto primalNode = mesh->node_ptr(primalNodeID);
+      // Now loop over the # of nodes on each dual element
+      std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
+      auto primalNode = mesh->node_ptr(primalNodeID);
 
-    for (unsigned int j = 0; j < primalElemIDs.size();
-         ++j) // n.second.size is number of dual nodes to the dual element
-    {
-      const dof_id_type dualNodeOnPElem_id =
-          primalElemIDs[j]; // Grab the dual nodes' IDs on each primal element
+      for (unsigned int j = 0; j < primalElemIDs.size();
+           ++j) // n.second.size is number of dual nodes to the dual element
+      {
+        const dof_id_type dualNodeOnPElem_id =
+            primalElemIDs[j]; // Grab the dual nodes' IDs on each primal element
 
-      auto const dualNodeOnPElem =
-          dualMesh->node_ptr(dualNodeOnPElem_id); // Grab the dual nodes corresponding to these IDs
+        auto const dualNodeOnPElem = dualMesh->node_ptr(
+            dualNodeOnPElem_id); // Grab the dual nodes corresponding to these IDs
 
-      Real dualNodeX = (dualNodeOnPElem->operator()(0)) - primalNode->operator()(0);
-      Real dualNodeY = (dualNodeOnPElem->operator()(1)) - primalNode->operator()(1);
-      Real nodePhi = atan2(dualNodeY, dualNodeX);
+        Real dualNodeX = (dualNodeOnPElem->operator()(0)) - primalNode->operator()(0);
+        Real dualNodeY = (dualNodeOnPElem->operator()(1)) - primalNode->operator()(1);
+        Real nodePhi = atan2(dualNodeY, dualNodeX);
 
-      dualNodesAndPhis.push_back({dualNodeOnPElem, nodePhi});
+        dualNodesAndPhis.push_back({dualNodeOnPElem, nodePhi});
 
-      std::sort(dualNodesAndPhis.begin(),
-                dualNodesAndPhis.end(),
-                [](const auto & a, const auto & b) { return a.second < b.second; });
-
+        std::sort(dualNodesAndPhis.begin(),
+                  dualNodesAndPhis.end(),
+                  [](const auto & a, const auto & b) { return a.second < b.second; });
+      }
       for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
       {
         dualElem->set_node(k,
                            dualNodesAndPhis[k].first); // assign these nodes to the the dual element
-      }
-    }
+      } ///********NEED TO IMLPLEMENT ADDING EXTERNAL NODES HERE AS WELL */
 
-    // add the element to the mesh, now that it's assigned nodes
-    dualMesh->add_elem(std::move(dualElem));
+      // add the element to the mesh, now that it's assigned nodes
+      dualMesh->add_elem(std::move(dualElem));
+      ///************NEED TO IMPLEMENT ADDING BOUNDARY ELEMENTS AS WELL */
+    }
   }
 
   //_console << "Printing info" << std::endl;
