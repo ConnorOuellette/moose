@@ -115,6 +115,12 @@ DualMeshGenerator::generate()
       } //_elem_to_node_map now has element IDs in the first entry and maps to the nodes that make
         // up that element
 
+      // loop over all element IDs
+      for (const & auto [elemID, nodeIDs] : _elem_to_node_map)
+      {
+        Elem primalElem = mesh->elem_ptr(elemID);
+      }
+
       // for (unsigned int i = 0; i < primalElem->n_neighbors(); ++i)
       //{
       //   if (primalElem->neighbor_ptr(i) == nullptr)
