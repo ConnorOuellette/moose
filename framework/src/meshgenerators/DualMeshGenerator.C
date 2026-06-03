@@ -116,19 +116,21 @@ DualMeshGenerator::generate()
         // up that element
 
       // loop over all element IDs
-      for (const & auto [elemID, nodeIDs] : _elem_to_node_map)
+      for (const auto & [elemID, nodeIDs] : _elem_to_node_map)
       {
-        Elem primalElem = mesh->elem_ptr(elemID);
+        Elem * primalElem = mesh->elem_ptr(elemID);
+        for (unsigned int i = 0; i < primalElem->n_neighbors(); ++i)
+        {
+          if (primalElem->neighbor_ptr(i) == nullptr)
+          {
+            _console << "OH NO!! " << std::endl;
+          }
+          else
+            _console << "Howdy neighbor" << std::endl;
+        }
       }
 
-      // for (unsigned int i = 0; i < primalElem->n_neighbors(); ++i)
-      //{
-      //   if (primalElem->neighbor_ptr(i) == nullptr)
-      //   {
-      //     _console << "OH NO!! " << std::endl;
-      //   }
-      // }
-
+      //
       continue;
     }
     else
