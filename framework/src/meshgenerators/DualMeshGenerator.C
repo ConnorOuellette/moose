@@ -96,29 +96,50 @@ DualMeshGenerator::generate()
   _console << "Mesh populated with dual nodes" << std::endl;
 
   // loop over all primal nodes / dual elements
-  for (const auto & n : _node_to_elem_map)
+  for (const auto & [primalNodeID, primalElemIDs] : _node_to_elem_map)
   {
-    _console << "Number of nodes for dual element: " << n.second.size() << std::endl;
-    if (n.second.size() < 3)
+    _console << "Number of nodes for dual element: " << primalElemIDs.size() << std::endl;
+    if (primalElemIDs.size() < 3)
     {
-      _console << "Skipping unbounded polygon with " << n.second.size() << " node(s)" << std::endl;
+      _console << "Found boundadry polygon with " << primalElemIDs.size() << " dual node(s)"
+               << std::endl;
+
+      std::unordered_map<dof_id_type, std::vector<dof_id_type>> _elem_to_node_map;
+
+      for (const auto & [node_id, elements] : _node_to_elem_map)
+      {
+        for (dof_id_type elem_id : elements)
+        {
+          _elem_to_node_map[elem_id].push_back(node_id);
+        }
+      } //_elem_to_node_map now has element IDs in the first entry and maps to the nodes that make
+        // up that element
+
+      // for (unsigned int i = 0; i < primalElem->n_neighbors(); ++i)
+      //{
+      //   if (primalElem->neighbor_ptr(i) == nullptr)
+      //   {
+      //     _console << "OH NO!! " << std::endl;
+      //   }
+      // }
+
       continue;
     }
     else
       _console << "Loading interor polygon!" << std::endl;
 
     // Define a dual element located at each primal node
-    std::unique_ptr<Elem> dualElem = std::make_unique<libMesh::C0Polygon>(n.second.size());
+    std::unique_ptr<Elem> dualElem = std::make_unique<libMesh::C0Polygon>(primalElemIDs.size());
 
     // Now loop over the # of nodes on each dual element
     std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
-    auto primalNode = mesh->node_ptr(n.first);
+    auto primalNode = mesh->node_ptr(primalNodeID);
 
-    for (unsigned int j = 0; j < n.second.size();
+    for (unsigned int j = 0; j < primalElemIDs.size();
          ++j) // n.second.size is number of dual nodes to the dual element
     {
       const dof_id_type dualNodeOnPElem_id =
-          n.second[j]; // Grab the dual nodes' IDs on each primal element
+          primalElemIDs[j]; // Grab the dual nodes' IDs on each primal element
 
       auto const dualNodeOnPElem =
           dualMesh->node_ptr(dualNodeOnPElem_id); // Grab the dual nodes corresponding to these IDs
