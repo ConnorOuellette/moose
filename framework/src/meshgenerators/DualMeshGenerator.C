@@ -98,11 +98,6 @@ DualMeshGenerator::generate()
   // loop over all primal nodes / dual elements
   for (const auto & n : _node_to_elem_map)
   {
-
-    // Define a dual element located at each primal node
-    std::unique_ptr<Elem> elem = std::make_unique<libMesh::C0Polygon>(n.second.size());
-    // Now loop over the # of nodes on each dual element
-
     _console << "Number of nodes for dual element: " << n.second.size() << std::endl;
     if (n.second.size() < 3)
     {
@@ -112,24 +107,46 @@ DualMeshGenerator::generate()
     else
       _console << "Loading interor polygon!" << std::endl;
 
-    for (unsigned int j = 0; j < n.second.size(); ++j)
+    // Define a dual element located at each primal node
+    std::unique_ptr<Elem> dualElem = std::make_unique<libMesh::C0Polygon>(n.second.size());
+
+    // Now loop over the # of nodes on each dual element
+    std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
+    auto primalNode = mesh->node_ptr(n.first);
+
+    for (unsigned int j = 0; j < n.second.size();
+         ++j) // n.second.size is number of dual nodes to the dual element
     {
       const dof_id_type dualNodeOnPElem_id =
           n.second[j]; // Grab the dual nodes' IDs on each primal element
 
-      auto dualNodeOnPElem =
+      auto const dualNodeOnPElem =
           dualMesh->node_ptr(dualNodeOnPElem_id); // Grab the dual nodes corresponding to these IDs
 
-      // assign these nodes to the polygon element
-      elem->set_node(j, dualNodeOnPElem); // assign these nodes to the the dual element
+      Real dualNodeX = (dualNodeOnPElem->operator()(0)) - primalNode->operator()(0);
+      Real dualNodeY = (dualNodeOnPElem->operator()(1)) - primalNode->operator()(1);
+      Real nodePhi = atan2(dualNodeY, dualNodeX);
+
+      dualNodesAndPhis.push_back({dualNodeOnPElem, nodePhi});
+
+      std::sort(dualNodesAndPhis.begin(),
+                dualNodesAndPhis.end(),
+                [](const auto & a, const auto & b) { return a.second < b.second; });
+
+      for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
+      {
+        dualElem->set_node(k,
+                           dualNodesAndPhis[k].first); // assign these nodes to the the dual element
+      }
     }
+
     // add the element to the mesh, now that it's assigned nodes
-    dualMesh->add_elem(std::move(elem));
+    dualMesh->add_elem(std::move(dualElem));
   }
 
-  _console << "Printing info" << std::endl;
+  //_console << "Printing info" << std::endl;
   dualMesh->print_info();
-  _console << "Finished printing info" << std::endl;
+  //_console << "Finished printing info" << std::endl;
 
   dualMesh->unset_is_prepared();
   return dynamic_pointer_cast<MeshBase>(dualMesh);
