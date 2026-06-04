@@ -72,8 +72,6 @@ DualMeshGenerator::generate()
   //////////Adding nodes//////
   for (const auto & in_elem : mesh->element_ptr_range())
   {
-    _console << "_______INPUT MESH INFO_______" << std::endl;
-    in_elem->print_info();
 
     _console << "Found centroid: " << in_elem->true_centroid() << std::endl;
 
@@ -103,42 +101,13 @@ DualMeshGenerator::generate()
   } //_elem_to_node_map now has element IDs in the first entry and maps to the nodes that make
     // up that element
 
-  // _____GETTING BOUNDARY NODES______ //
-  std::vector<libMesh::Point> extDualNodes;
-  // loop over all element IDs
-  for (const auto & [elemID, nodeIDs] : _elem_to_node_map)
-  {
-    Elem * primalElem = mesh->elem_ptr(elemID);
-    for (unsigned int i = 0; i < primalElem->n_neighbors(); ++i)
-    {
-      auto ext_neighbor = primalElem->neighbor_ptr(i);
-      if (ext_neighbor == nullptr)
-      {
-        _console << "OH NO!! " << std::endl;
-        std::vector<libMesh::Point> extPrimalNodes;
-        // This means the side to which this neighbor is is exterior.
-        for (const auto & extPrimalNode : primalElem->nodes_on_side(
-                 primalElem->which_side_am_i(ext_neighbor))) //"for the nodes on this side"
-        {
-          extPrimalNodes.push_back(extPrimalNode);
-        }
-        // find midpoint.
-        Point extDualNode = (extPrimalNodes[0] + extPrimalNodes[1]) / 2;
-        extDualNodes.push_back(extDualNode);
-        // Store these midpoints in ext_nodes
-      }
-      else
-        _console << "Howdy neighbor" << std::endl;
-    }
-    _console << "Next Element!" << std::endl;
-  }
-
   _console << "Mesh populated with dual nodes" << std::endl;
 
   // loop over all primal nodes / dual elements
   for (const auto & [primalNodeID, primalElemIDs] : _node_to_elem_map)
   {
     _console << "Number of nodes for dual element: " << primalElemIDs.size() << std::endl;
+
     if (primalElemIDs.size() >= 3)
     {
 
@@ -174,11 +143,96 @@ DualMeshGenerator::generate()
       {
         dualElem->set_node(k,
                            dualNodesAndPhis[k].first); // assign these nodes to the the dual element
-      } ///********NEED TO IMLPLEMENT ADDING EXTERNAL NODES HERE AS WELL */
+      }
 
       // add the element to the mesh, now that it's assigned nodes
       dualMesh->add_elem(std::move(dualElem));
-      ///************NEED TO IMPLEMENT ADDING BOUNDARY ELEMENTS AS WELL */
+    }
+    else
+    {
+      // Here are the elements with less than 3 dual nodes, that need to have midpoints added to be
+      // polygons.
+      // _____GETTING BOUNDARY NODES______ //
+      // loop over all primal elements
+      for (const auto & [elemID, nodeIDs] : _elem_to_node_map)
+      {
+        Elem * primalElem = mesh->elem_ptr(elemID);
+        std::vector<Node *> extDualNodesOnPrimalElem;
+        for (const auto & side : primalElem->side_index_range())
+        {
+          if (primalElem->neighbor_ptr(side) == nullptr)
+          {
+            std::vector<unsigned int> extPrimalNodeIDs = primalElem->nodes_on_side(side);
+            _console << "found bordering side with nodes: " << std::endl;
+            for (const auto & nodeID : extPrimalNodeIDs)
+            {
+              Node * node = mesh->node_ptr(nodeID);
+              node->print_info();
+            }
+
+            // find midpoint.
+            Point midPoint;
+            for (const auto & nodeID : extPrimalNodeIDs)
+            {
+              Node * node = mesh->node_ptr(nodeID);
+              midPoint += *node;
+            }
+            midPoint /= extPrimalNodeIDs.size();
+
+            Node * midpointNode = dualMesh->add_point(midPoint);
+            extDualNodesOnPrimalElem.push_back(midpointNode);
+            //_console << "found mipoint with info" << std::endl;
+            // midpointNode->print_info();
+          }
+        }
+
+        // We have a vector of points that should be dual nodes. Add them to a dual element!
+        std::unique_ptr<Elem> extDualElem = std::make_unique<libMesh::C0Polygon>(
+            primalElemIDs.size() + extDualNodesOnPrimalElem.size());
+        // Lets compile the interior nodes and the boundary nodes into a single vector for sorting
+        std::vector<std::pair<Node *, Real>> nodesAndPhis;
+        auto primalNode = mesh->node_ptr(primalNodeID);
+
+        // Add the interior nodes to the vector
+        for (unsigned int k = 0; k < primalElemIDs.size(); ++k)
+        {
+          Node * intNode = dualMesh->node_ptr(primalElemIDs[k]);
+          nodesAndPhis.push_back({intNode, 0}); // Phi placeholder
+        }
+
+        // Adding boundary nodes to the vector
+        for (unsigned int k = 0; k < extDualNodesOnElem.size(); ++k)
+        {
+          nodesAndPhis.push_back({extDualNodesOnElem[k], 0});
+          // extDualElem->set_node((k + primalElemIDs.size()), extDualNodesOnElem[k]);
+        }
+
+        for (unsigned int j = 0; j < nodesAndPhis.size(); ++j)
+        {
+          Node * node = nodesAndPhis[j].first;
+
+          Real nodeX = (node->operator()(0)) - primalNode->operator()(0);
+          Real nodeY = (node->operator()(1)) - primalNode->operator()(1);
+          Real nodePhi = atan2(nodeY, nodeX);
+
+          nodesAndPhis[j].second = nodePhi;
+        }
+        std::sort(nodesAndPhis.begin(),
+                  nodesAndPhis.end(),
+                  [](const auto & a, const auto & b) { return a.second < b.second; });
+        // Now they are sorted by their Phi. Now set them to the element in their order
+
+        for (unsigned int k = 0; k < nodesAndPhis.size(); ++k)
+        {
+          _console << "Adding point with phi: " << nodesAndPhis[k].second << std::endl;
+          extDualElem->set_node(k, nodesAndPhis[k].first);
+        }
+        //_console << "Adding element to mesh with info: " << std::endl;
+        // extDualElem->print_info();
+
+        dualMesh->add_elem(std::move(extDualElem));
+        _console << "Next Element!" << std::endl;
+      }
     }
   }
 
