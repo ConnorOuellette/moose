@@ -82,7 +82,6 @@ DualMeshGenerator::generate()
       _node_to_elem_map[in_elem->node_id(n)].push_back(in_elem->id());
     }
   }
-  _console << "Successfully created node-element mapping" << std::endl;
 
   auto dualMesh = buildReplicatedMesh(mesh->mesh_dimension());
 
@@ -120,7 +119,7 @@ DualMeshGenerator::generate()
         for (unsigned int i = 0; i < side_elem->n_nodes(); ++i)
         {
           Node * node = side_elem->node_ptr(i);
-          node->print_info();
+          // node->print_info();
           side_nodes.push_back(node);
         }
 
@@ -135,12 +134,12 @@ DualMeshGenerator::generate()
         for (auto * node : side_nodes)
           node_to_boundary_midpoints[node->id()].push_back(midPoint);
 
-        _console << "Calculated midpoint: " << std::endl;
-        midPoint.print();
-        _console << "\n" << std::endl;
+        //_console << "Calculated midpoint: " << std::endl;
+        // midPoint.print();
+        //_console << "\n" << std::endl;
       }
     }
-    _console << "Looking at next Element..." << std::endl;
+    //_console << "Looking at next Element..." << std::endl;
   }
   // boundaryMidPoints now contains all of the node pointers that are boundary nodes that might need
   // to be added to a dual mesh.
@@ -233,15 +232,8 @@ DualMeshGenerator::generate()
 
         dualMesh->add_elem(std::move(dualElem));
       }
-
-      // Here we have a dual element with less than 3 dual nodes, that need to have midpoints
-      // added to properly add the dual element to the dual mesh.
     }
   }
-
-  //_console << "Printing info" << std::endl;
-  dualMesh->print_info();
-  //_console << "Finished printing info" << std::endl;
 
   dualMesh->unset_is_prepared();
   return dynamic_pointer_cast<MeshBase>(dualMesh);
