@@ -178,16 +178,18 @@ DualMeshGenerator::generate()
     _console << "Number of nodes for dual element: " << primalElemIDs.size() << std::endl;
     const bool is_boundary_node =
         node_to_boundary_midpoints.find(primalNodeID) != node_to_boundary_midpoints.end();
+    std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
+    std::unique_ptr<Elem> dualElem;
     if (!is_boundary_node)
     {
 
       _console << "Loading interor polygon!" << std::endl;
 
       // Define a dual element located at each primal node
-      std::unique_ptr<Elem> dualElem = std::make_unique<libMesh::C0Polygon>(primalElemIDs.size());
+      dualElem = std::make_unique<libMesh::C0Polygon>(primalElemIDs.size());
 
       // Now loop over the # of nodes on each dual element
-      std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
+
       auto primalNode = mesh->node_ptr(primalNodeID);
 
       for (unsigned int j = 0; j < primalElemIDs.size();
@@ -214,14 +216,10 @@ DualMeshGenerator::generate()
         dualElem->set_node(k,
                            dualNodesAndPhis[k].first); // assign these nodes to the the dual element
       }
-
-      // add the element to the mesh, now that it's assigned nodes
-      dualMesh->add_elem(std::move(dualElem));
     }
     else
     {
 
-      std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
       Node * primalNode = mesh->node_ptr(primalNodeID);
 
       if (isBoundaryVertex(primalNodeID))
@@ -239,25 +237,17 @@ DualMeshGenerator::generate()
       for (const auto elem_id : primalElemIDs)
       {
         Node * dualNode = dualMesh->node_ptr(elem_id);
-
-        Real dx = (*dualNode)(0) - (*primalNode)(0);
-        Real dy = (*dualNode)(1) - (*primalNode)(1);
-
-        dualNodesAndPhis.push_back({dualNode, std::atan2(dy, dx)});
+        dualNodesAndPhis.push_back({dualNode, 0.0});
       }
 
       // Add boundary midpoint nodes
       for (const auto & midpoint : node_to_boundary_midpoints[primalNodeID])
       {
         Node * midpointNode = dualMesh->add_point(midpoint);
-
-        Real dx = midpoint(0) - (*primalNode)(0);
-        Real dy = midpoint(1) - (*primalNode)(1);
-
-        dualNodesAndPhis.push_back({midpointNode, std::atan2(dy, dx)});
+        dualNodesAndPhis.push_back({midpointNode, 0.0});
       }
 
-      // Recompute angles around the geometric center of corner dual elements.
+      // Recompute angles around the geometric center of boundary elements
 
       Point center;
 
@@ -277,15 +267,22 @@ DualMeshGenerator::generate()
 
       if (dualNodesAndPhis.size() >= 3)
       {
-        std::unique_ptr<Elem> dualElem =
-            std::make_unique<libMesh::C0Polygon>(dualNodesAndPhis.size());
-
+        dualElem = std::make_unique<libMesh::C0Polygon>(dualNodesAndPhis.size());
+        _console << "Adding an element with " << dualNodesAndPhis.size() << " nodes:" << std::endl;
+        _console << "_____________________________" << std::endl;
         for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
+        {
           dualElem->set_node(k, dualNodesAndPhis[k].first);
-
-        dualMesh->add_elem(std::move(dualElem));
+          dualNodesAndPhis[k].first->print_info();
+          _console << "With PHI = " << dualNodesAndPhis[k].second / 3.14159265357 << "*pi"
+                   << std::endl;
+        }
       }
     }
+    std::sort(dualNodesAndPhis.begin(),
+              dualNodesAndPhis.end(),
+              [](const auto & a, const auto & b) { return a.second < b.second; });
+    dualMesh->add_elem(std::move(dualElem));
   }
 
   dualMesh->unset_is_prepared();
