@@ -193,8 +193,21 @@ DualMeshGenerator::generate()
     {
 
       std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
+      Node * primalNode = mesh->node_ptr(primalNodeID);
 
-      auto primalNode = mesh->node_ptr(primalNodeID);
+      // Special case -- if we're on a corner, we only have 1 primal node, and we want to grab the
+      // primal corner node and add it directly to the dual mesh so we preserve volume
+      if (primalElemIDs.size() == 1)
+      {
+
+        // get the primal corner
+        Node * cornerNode = dualMesh->add_point(*mesh->node_ptr(primalNodeID));
+        dualNodesAndPhis.push_back({cornerNode, 0.0});
+      }
+
+      // loop over all nodes, the loop over all elements in the primal mesh.
+
+      // if for this node, it belongs to only one element, add it to dualNodesAndPhis
 
       // Add centroid nodes from adjacent primal elements
       for (const auto elem_id : primalElemIDs)
@@ -216,6 +229,23 @@ DualMeshGenerator::generate()
         Real dy = midpoint(1) - (*primalNode)(1);
 
         dualNodesAndPhis.push_back({midpointNode, std::atan2(dy, dx)});
+      }
+
+      // Special handling for corner dual cells.
+      // Recompute angles around the geometric center of the dual polygon.
+      if (primalElemIDs.size() == 1)
+      {
+        Point center;
+
+        for (const auto & [node, phi] : dualNodesAndPhis)
+          center += *node;
+
+        center /= dualNodesAndPhis.size();
+
+        for (auto & [node, phi] : dualNodesAndPhis)
+        {
+          phi = std::atan2((*node)(1) - center(1), (*node)(0) - center(0));
+        }
       }
 
       std::sort(dualNodesAndPhis.begin(),
