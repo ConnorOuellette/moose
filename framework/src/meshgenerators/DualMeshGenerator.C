@@ -28,19 +28,19 @@ DualMeshGenerator::validParams()
   params.addClassDescription("Takes a 2D mesh as input and returns a Voronoi dual mesh, i.e.,"
                              "changes each input mode into an element and each input element "
                              "into a node located at its centroid.");
-  params.addRequiredParam<RealVectorValue>(
-      "bottom_left", "The bottom left point (in x,y,z with spaces in-between).");
-  params.addRequiredParam<RealVectorValue>(
-      "top_right", "The bottom left point (in x,y,z with spaces in-between).");
-  params.addRequiredParam<subdomain_id_type>(
-      "block_id", "Subdomain id to set for inside/outside the bounding box");
-  params.addParam<SubdomainName>(
-      "block_name", "Subdomain name to set for inside/outside the bounding box (optional)");
-  params.addParam<MooseEnum>(
-      "location", location, "Control of where the subdomain id is to be set");
-  params.addParam<std::vector<SubdomainName>>(
-      "restricted_subdomains",
-      "Only reset subdomain ID for given subdomains within the bounding box");
+  // params.addRequiredParam<RealVectorValue>(
+  //     "bottom_left", "The bottom left point (in x,y,z with spaces in-between).");
+  // params.addRequiredParam<RealVectorValue>(
+  //     "top_right", "The bottom left point (in x,y,z with spaces in-between).");
+  // params.addRequiredParam<subdomain_id_type>(
+  //    "block_id", "Subdomain id to set for inside/outside the bounding box");
+  // params.addParam<SubdomainName>(
+  //    "block_name", "Subdomain name to set for inside/outside the bounding box (optional)");
+  // params.addParam<MooseEnum>(
+  //     "location", location, "Control of where the subdomain id is to be set");
+  // params.addParam<std::vector<SubdomainName>>(
+  //    "restricted_subdomains",
+  //    "Only reset subdomain ID for given subdomains within the bounding box");
 
   params.addParam<std::string>("integer_name",
                                "Element integer to be assigned (default to subdomain ID)");
@@ -48,13 +48,12 @@ DualMeshGenerator::validParams()
 }
 
 DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
-  : MeshGenerator(parameters),
-    _input(getMesh("input")),
-    _location(parameters.get<MooseEnum>("location")),
-    _block_id(parameters.get<subdomain_id_type>("block_id")),
-    _has_restriction(isParamValid("restricted_subdomains")),
-    _bounding_box(MooseUtils::buildBoundingBox(parameters.get<RealVectorValue>("bottom_left"),
-                                               parameters.get<RealVectorValue>("top_right")))
+  : MeshGenerator(parameters), _input(getMesh("input"))
+//_location(parameters.get<MooseEnum>("location")),
+//_block_id(parameters.get<subdomain_id_type>("block_id")),
+//_has_restriction(isParamValid("restricted_subdomains"))
+/*_bounding_box(MooseUtils::buildBoundingBox(parameters.get<RealVectorValue>("bottom_left"),
+                                           parameters.get<RealVectorValue>("top_right"))) */
 {
 }
 
