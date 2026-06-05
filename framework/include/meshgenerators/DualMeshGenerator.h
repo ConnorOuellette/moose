@@ -20,7 +20,7 @@ class BoundingBox;
 }
 
 /**
- * MeshGenerator for defining a Subdomain inside or outside of a bounding box
+ * MeshGenerator for creating dual mesh
  */
 class DualMeshGenerator : public MeshGenerator
 {
@@ -33,4 +33,7 @@ public:
 
 protected:
   std::unique_ptr<MeshBase> & _input;
+
+  // Vertex tolerance for determining colinearity of adjacent sides
+  Real _boundary_node_angular_tol;
 };
