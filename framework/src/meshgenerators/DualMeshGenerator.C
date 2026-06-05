@@ -105,6 +105,7 @@ DualMeshGenerator::generate()
   // Get what nodes are boundary nodes
   // looping over primal elements....
   std::unordered_map<dof_id_type, std::vector<Point>> node_to_boundary_midpoints;
+  std::unordered_map<dof_id_type, std::vector<dof_id_type>> node_to_boundary_neighbors;
   for (const auto & primalElem : mesh->element_ptr_range())
   {
     // looping over each side
@@ -119,7 +120,7 @@ DualMeshGenerator::generate()
         for (unsigned int i = 0; i < side_elem->n_nodes(); ++i)
         {
           Node * node = side_elem->node_ptr(i);
-          // node->print_info();
+          node->print_info();
           side_nodes.push_back(node);
         }
 
@@ -134,15 +135,53 @@ DualMeshGenerator::generate()
         for (auto * node : side_nodes)
           node_to_boundary_midpoints[node->id()].push_back(midPoint);
 
-        //_console << "Calculated midpoint: " << std::endl;
-        // midPoint.print();
-        //_console << "\n" << std::endl;
+        // Recording boundary edge connectivity
+        if (side_nodes.size() == 2)
+        {
+          const auto id0 = side_nodes[0]->id();
+          const auto id1 = side_nodes[1]->id();
+
+          node_to_boundary_neighbors[id0].push_back(id1);
+          node_to_boundary_neighbors[id1].push_back(id0);
+        }
       }
     }
     //_console << "Looking at next Element..." << std::endl;
   }
   // boundaryMidPoints now contains all of the node pointers that are boundary nodes that might need
   // to be added to a dual mesh.
+  // Boundary Helper
+  auto isBoundaryVertex = [&](dof_id_type node_id) -> bool
+  {
+    auto it = node_to_boundary_neighbors.find(node_id);
+    if (it == node_to_boundary_neighbors.end())
+      return false;
+
+    auto neighbors = it->second;
+
+    std::sort(neighbors.begin(), neighbors.end());
+    neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+
+    if (neighbors.size() != 2)
+      return false;
+
+    const Point & p = *mesh->node_ptr(node_id);
+    Point v0 = *mesh->node_ptr(neighbors[0]) - p;
+    Point v1 = *mesh->node_ptr(neighbors[1]) - p;
+
+    const Real n0 = v0.norm();
+    const Real n1 = v1.norm();
+
+    if (n0 == 0.0 || n1 == 0.0)
+      return false;
+
+    Real c = (v0 * v1) / (n0 * n1);
+    c = std::max(Real(-1), std::min(Real(1), c));
+
+    const Real angle_deg = std::acos(c) * 180.0 / libMesh::pi;
+
+    return std::abs(angle_deg - 180.0) > 1.0;
+  };
 
   // loop over all primal nodes / dual elements
   for (const auto & [primalNodeID, primalElemIDs] : _node_to_elem_map)
@@ -195,13 +234,10 @@ DualMeshGenerator::generate()
       std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
       Node * primalNode = mesh->node_ptr(primalNodeID);
 
-      // Special case -- if we're on a corner, we only have 1 primal node, and we want to grab the
-      // primal corner node and add it directly to the dual mesh so we preserve volume
-      if (primalElemIDs.size() == 1)
+      if (isBoundaryVertex(primalNodeID))
       {
-
-        // get the primal corner
         Node * cornerNode = dualMesh->add_point(*mesh->node_ptr(primalNodeID));
+
         dualNodesAndPhis.push_back({cornerNode, 0.0});
       }
 
@@ -231,21 +267,18 @@ DualMeshGenerator::generate()
         dualNodesAndPhis.push_back({midpointNode, std::atan2(dy, dx)});
       }
 
-      // Special handling for corner dual cells.
-      // Recompute angles around the geometric center of the dual polygon.
-      if (primalElemIDs.size() == 1)
+      // Recompute angles around the geometric center of corner dual elements.
+
+      Point center;
+
+      for (const auto & [node, phi] : dualNodesAndPhis)
+        center += *node;
+
+      center /= dualNodesAndPhis.size();
+
+      for (auto & [node, phi] : dualNodesAndPhis)
       {
-        Point center;
-
-        for (const auto & [node, phi] : dualNodesAndPhis)
-          center += *node;
-
-        center /= dualNodesAndPhis.size();
-
-        for (auto & [node, phi] : dualNodesAndPhis)
-        {
-          phi = std::atan2((*node)(1) - center(1), (*node)(0) - center(0));
-        }
+        phi = std::atan2((*node)(1) - center(1), (*node)(0) - center(0));
       }
 
       std::sort(dualNodesAndPhis.begin(),
