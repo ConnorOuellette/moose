@@ -139,6 +139,7 @@ DualMeshGenerator::generate()
   // boundaryMidPoints now contains all of the node pointers that are boundary nodes that might need
   // to be added to a dual mesh.
   // Boundary Helper
+
   auto isBoundaryVertex = [&](dof_id_type node_id) -> bool
   {
     auto it = node_to_boundary_neighbors.find(node_id);
@@ -175,8 +176,9 @@ DualMeshGenerator::generate()
   for (const auto & [primalNodeID, primalElemIDs] : _node_to_elem_map)
   {
     _console << "Number of nodes for dual element: " << primalElemIDs.size() << std::endl;
-
-    if (primalElemIDs.size() >= 3)
+    const bool is_boundary_node =
+        node_to_boundary_midpoints.find(primalNodeID) != node_to_boundary_midpoints.end();
+    if (!is_boundary_node)
     {
 
       _console << "Loading interor polygon!" << std::endl;
