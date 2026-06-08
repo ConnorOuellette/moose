@@ -327,17 +327,12 @@ DualMeshGenerator::generate()
     const bool is_boundary_node =
         node_to_boundary_midpoints.find(primalNodeID) != node_to_boundary_midpoints.end();
     std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
-    if (!is_boundary_node)
+    if (!is_boundary_node) // For interior polygons we needn't worry about the boundary
     {
-
-      _console << "Loading interor polygon!" << std::endl;
-
       // Now loop over the # of nodes on each dual element
-
       auto primalNode = mesh->node_ptr(primalNodeID);
 
-      for (unsigned int j = 0; j < primalElemIDs.size();
-           ++j) // n.second.size is number of dual nodes to the dual element
+      for (unsigned int j = 0; j < primalElemIDs.size(); ++j)
       {
         const dof_id_type dualNodeOnPElem_id =
             primalElemIDs[j]; // Grab the dual nodes' IDs on each primal element
@@ -356,7 +351,7 @@ DualMeshGenerator::generate()
                   [](const auto & a, const auto & b) { return a.second < b.second; });
       }
     }
-    else
+    else // boundary dual elements
     {
 
       Node * primalNode = mesh->node_ptr(primalNodeID);
