@@ -169,7 +169,108 @@ DualMeshGenerator::generate()
 
     const Real angle_deg = std::acos(c) * 180.0 / libMesh::pi;
 
-    return std::abs(angle_deg - 180.0) > 1.0;
+    return std::abs(angle_deg - 180.0) > _boundary_node_angular_tol;
+  };
+
+  auto signedArea = [](const std::vector<Node *> & nodes) -> Real
+  {
+    Real area = 0.0;
+
+    for (unsigned int i = 0; i < nodes.size(); ++i)
+    {
+      const Point & p = *nodes[i];
+      const Point & q = *nodes[(i + 1) % nodes.size()];
+
+      area += p(0) * q(1) - q(0) * p(1);
+    }
+
+    return 0.5 * area;
+  };
+
+  auto cross2D = [](const Point & a, const Point & b, const Point & c) -> Real
+  { return (b(0) - a(0)) * (c(1) - a(1)) - (b(1) - a(1)) * (c(0) - a(0)); };
+
+  auto isConcavePolygon = [&](const std::vector<Node *> & nodes) -> bool
+  {
+    if (nodes.size() < 4)
+      return false;
+
+    const Real orientation = signedArea(nodes);
+
+    for (unsigned int i = 0; i < nodes.size(); ++i)
+    {
+      const Point & prev = *nodes[(i + nodes.size() - 1) % nodes.size()];
+      const Point & curr = *nodes[i];
+      const Point & next = *nodes[(i + 1) % nodes.size()];
+
+      const Real cross = cross2D(prev, curr, next);
+
+      if (orientation > 0.0 && cross < -TOLERANCE)
+        return true;
+
+      if (orientation < 0.0 && cross > TOLERANCE)
+        return true;
+    }
+
+    return false;
+  };
+
+  auto addTriangle = [&](Node * a, Node * b, Node * c)
+  {
+    auto tri = std::make_unique<libMesh::C0Polygon>(3);
+    tri->set_node(0, a);
+    tri->set_node(1, b);
+    tri->set_node(2, c);
+    dualMesh->add_elem(std::move(tri));
+  };
+
+  auto addConvexOrTriangulatedPolygon = [&](std::vector<Node *> nodes)
+  {
+    if (nodes.size() < 3)
+      return;
+
+    if (!isConcavePolygon(nodes))
+    {
+      auto elem = std::make_unique<libMesh::C0Polygon>(nodes.size());
+
+      for (unsigned int i = 0; i < nodes.size(); ++i)
+        elem->set_node(i, nodes[i]);
+
+      dualMesh->add_elem(std::move(elem));
+      return;
+    }
+
+    if (signedArea(nodes) < 0.0)
+      std::reverse(nodes.begin(), nodes.end());
+
+    while (nodes.size() > 3)
+    {
+      bool clipped = false;
+
+      for (unsigned int i = 0; i < nodes.size(); ++i)
+      {
+        const unsigned int prev_i = (i + nodes.size() - 1) % nodes.size();
+        const unsigned int next_i = (i + 1) % nodes.size();
+
+        Node * prev = nodes[prev_i];
+        Node * curr = nodes[i];
+        Node * next = nodes[next_i];
+
+        if (cross2D(*prev, *curr, *next) <= TOLERANCE)
+          continue;
+
+        addTriangle(prev, curr, next);
+
+        nodes.erase(nodes.begin() + i);
+        clipped = true;
+        break;
+      }
+
+      if (!clipped)
+        mooseError("Failed to triangulate concave dual polygon.");
+    }
+
+    addTriangle(nodes[0], nodes[1], nodes[2]);
   };
 
   // loop over all primal nodes / dual elements
@@ -211,11 +312,11 @@ DualMeshGenerator::generate()
                   dualNodesAndPhis.end(),
                   [](const auto & a, const auto & b) { return a.second < b.second; });
       }
-      for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
+      /*for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
       {
         dualElem->set_node(k,
                            dualNodesAndPhis[k].first); // assign these nodes to the the dual element
-      }
+      }*/
     }
     else
     {
@@ -249,16 +350,18 @@ DualMeshGenerator::generate()
 
       // Recompute angles around the geometric center of boundary elements
 
-      Point center;
+      Point centroid_avg;
 
-      for (const auto & [node, phi] : dualNodesAndPhis)
-        center += *node;
+      for (const auto elem_id : primalElemIDs)
+        centroid_avg += *dualMesh->node_ptr(elem_id);
 
-      center /= dualNodesAndPhis.size();
+      centroid_avg /= primalElemIDs.size();
+
+      Point sort_center = 0.5 * ((*primalNode) + centroid_avg);
 
       for (auto & [node, phi] : dualNodesAndPhis)
       {
-        phi = std::atan2((*node)(1) - center(1), (*node)(0) - center(0));
+        phi = std::atan2((*node)(1) - sort_center(1), (*node)(0) - sort_center(0));
       }
 
       std::sort(dualNodesAndPhis.begin(),
@@ -270,19 +373,26 @@ DualMeshGenerator::generate()
         dualElem = std::make_unique<libMesh::C0Polygon>(dualNodesAndPhis.size());
         _console << "Adding an element with " << dualNodesAndPhis.size() << " nodes:" << std::endl;
         _console << "_____________________________" << std::endl;
-        for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
+        /*for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
         {
           dualElem->set_node(k, dualNodesAndPhis[k].first);
           dualNodesAndPhis[k].first->print_info();
           _console << "With PHI = " << dualNodesAndPhis[k].second / 3.14159265357 << "*pi"
                    << std::endl;
-        }
+        }*/
       }
     }
     std::sort(dualNodesAndPhis.begin(),
               dualNodesAndPhis.end(),
               [](const auto & a, const auto & b) { return a.second < b.second; });
-    dualMesh->add_elem(std::move(dualElem));
+
+    std::vector<Node *> ordered_nodes;
+    ordered_nodes.reserve(dualNodesAndPhis.size());
+
+    for (const auto & node_phi : dualNodesAndPhis)
+      ordered_nodes.push_back(node_phi.first);
+
+    addConvexOrTriangulatedPolygon(ordered_nodes);
   }
 
   dualMesh->unset_is_prepared();
