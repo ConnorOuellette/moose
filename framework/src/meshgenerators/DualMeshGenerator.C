@@ -94,6 +94,8 @@ DualMeshGenerator::generate()
   // looping over primal elements....
   std::unordered_map<dof_id_type, std::vector<Point>> node_to_boundary_midpoints;
   std::unordered_map<dof_id_type, std::vector<dof_id_type>> node_to_boundary_neighbors;
+  std::unordered_set<dof_id_type> corner_node_ids;
+  std::unordered_set<dof_id_type> midpoint_node_ids;
   for (const auto & primalElem : mesh->element_ptr_range())
   {
     // looping over each side
@@ -134,7 +136,6 @@ DualMeshGenerator::generate()
         }
       }
     }
-    //_console << "Looking at next Element..." << std::endl;
   }
   // boundaryMidPoints now contains all of the node pointers that are boundary nodes that might need
   // to be added to a dual mesh.
@@ -224,6 +225,19 @@ DualMeshGenerator::generate()
     dualMesh->add_elem(std::move(tri));
   };
 
+  auto triangleArea = [](const Node * a, const Node * b, const Node * c) -> Real
+  {
+    return std::abs(((*b)(0) - (*a)(0)) * ((*c)(1) - (*a)(1)) -
+                    ((*b)(1) - (*a)(1)) * ((*c)(0) - (*a)(0))) *
+           0.5;
+  };
+
+  auto isCornerNode = [&](const Node * node) -> bool
+  { return corner_node_ids.find(node->id()) != corner_node_ids.end(); };
+
+  auto isMidpointNode = [&](const Node * node) -> bool
+  { return midpoint_node_ids.find(node->id()) != midpoint_node_ids.end(); };
+
   auto addConvexOrTriangulatedPolygon = [&](std::vector<Node *> nodes)
   {
     if (nodes.size() < 3)
@@ -240,37 +254,70 @@ DualMeshGenerator::generate()
       return;
     }
 
-    if (signedArea(nodes) < 0.0)
-      std::reverse(nodes.begin(), nodes.end());
+    Node * cornerNode = nullptr;
 
-    while (nodes.size() > 3)
+    for (auto * node : nodes)
     {
-      bool clipped = false;
-
-      for (unsigned int i = 0; i < nodes.size(); ++i)
+      if (isCornerNode(node))
       {
-        const unsigned int prev_i = (i + nodes.size() - 1) % nodes.size();
-        const unsigned int next_i = (i + 1) % nodes.size();
+        cornerNode = node;
+        break;
+      }
+    }
 
-        Node * prev = nodes[prev_i];
-        Node * curr = nodes[i];
-        Node * next = nodes[next_i];
+    if (!cornerNode)
+      mooseError("Concave polygon was detected, but no corner node was found.");
 
-        if (cross2D(*prev, *curr, *next) <= TOLERANCE)
-          continue;
+    std::vector<std::pair<Node *, Real>> sorted_nodes;
 
-        addTriangle(prev, curr, next);
+    for (auto * node : nodes)
+    {
+      if (node == cornerNode)
+        continue;
 
-        nodes.erase(nodes.begin() + i);
-        clipped = true;
+      const Real phi = std::atan2((*node)(1) - (*cornerNode)(1), (*node)(0) - (*cornerNode)(0));
+
+      sorted_nodes.push_back({node, phi});
+    }
+
+    std::sort(sorted_nodes.begin(),
+              sorted_nodes.end(),
+              [](const auto & a, const auto & b) { return a.second < b.second; });
+    std::vector<Node *> fan_nodes;
+
+    for (unsigned int i = 0; i < sorted_nodes.size(); ++i)
+    {
+      if (!isMidpointNode(sorted_nodes[i].first))
+        continue;
+
+      const unsigned int next_i = (i + 1) % sorted_nodes.size();
+      const unsigned int prev_i = (i + sorted_nodes.size() - 1) % sorted_nodes.size();
+
+      // Prefer the direction where the first step from the boundary midpoint
+      // goes to an interior/centroid node, not another boundary midpoint.
+      if (!isMidpointNode(sorted_nodes[next_i].first))
+      {
+        for (unsigned int k = 0; k < sorted_nodes.size(); ++k)
+          fan_nodes.push_back(sorted_nodes[(i + k) % sorted_nodes.size()].first);
+
         break;
       }
 
-      if (!clipped)
-        mooseError("Failed to triangulate concave dual polygon.");
+      if (!isMidpointNode(sorted_nodes[prev_i].first))
+      {
+        for (unsigned int k = 0; k < sorted_nodes.size(); ++k)
+          fan_nodes.push_back(
+              sorted_nodes[(i + sorted_nodes.size() - k) % sorted_nodes.size()].first);
+
+        break;
+      }
     }
 
-    addTriangle(nodes[0], nodes[1], nodes[2]);
+    if (fan_nodes.empty())
+      mooseError("Could not find a boundary midpoint to start concave fan triangulation.");
+
+    for (unsigned int i = 0; i + 1 < fan_nodes.size(); ++i)
+      addTriangle(cornerNode, fan_nodes[i], fan_nodes[i + 1]);
   };
 
   // loop over all primal nodes / dual elements
@@ -280,14 +327,10 @@ DualMeshGenerator::generate()
     const bool is_boundary_node =
         node_to_boundary_midpoints.find(primalNodeID) != node_to_boundary_midpoints.end();
     std::vector<std::pair<Node *, Real>> dualNodesAndPhis;
-    std::unique_ptr<Elem> dualElem;
     if (!is_boundary_node)
     {
 
       _console << "Loading interor polygon!" << std::endl;
-
-      // Define a dual element located at each primal node
-      dualElem = std::make_unique<libMesh::C0Polygon>(primalElemIDs.size());
 
       // Now loop over the # of nodes on each dual element
 
@@ -312,11 +355,6 @@ DualMeshGenerator::generate()
                   dualNodesAndPhis.end(),
                   [](const auto & a, const auto & b) { return a.second < b.second; });
       }
-      /*for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
-      {
-        dualElem->set_node(k,
-                           dualNodesAndPhis[k].first); // assign these nodes to the the dual element
-      }*/
     }
     else
     {
@@ -326,13 +364,10 @@ DualMeshGenerator::generate()
       if (isBoundaryVertex(primalNodeID))
       {
         Node * cornerNode = dualMesh->add_point(*mesh->node_ptr(primalNodeID));
+        corner_node_ids.insert(cornerNode->id());
 
         dualNodesAndPhis.push_back({cornerNode, 0.0});
       }
-
-      // loop over all nodes, the loop over all elements in the primal mesh.
-
-      // if for this node, it belongs to only one element, add it to dualNodesAndPhis
 
       // Add centroid nodes from adjacent primal elements
       for (const auto elem_id : primalElemIDs)
@@ -345,6 +380,7 @@ DualMeshGenerator::generate()
       for (const auto & midpoint : node_to_boundary_midpoints[primalNodeID])
       {
         Node * midpointNode = dualMesh->add_point(midpoint);
+        midpoint_node_ids.insert(midpointNode->id());
         dualNodesAndPhis.push_back({midpointNode, 0.0});
       }
 
@@ -362,24 +398,6 @@ DualMeshGenerator::generate()
       for (auto & [node, phi] : dualNodesAndPhis)
       {
         phi = std::atan2((*node)(1) - sort_center(1), (*node)(0) - sort_center(0));
-      }
-
-      std::sort(dualNodesAndPhis.begin(),
-                dualNodesAndPhis.end(),
-                [](const auto & a, const auto & b) { return a.second < b.second; });
-
-      if (dualNodesAndPhis.size() >= 3)
-      {
-        dualElem = std::make_unique<libMesh::C0Polygon>(dualNodesAndPhis.size());
-        _console << "Adding an element with " << dualNodesAndPhis.size() << " nodes:" << std::endl;
-        _console << "_____________________________" << std::endl;
-        /*for (unsigned int k = 0; k < dualNodesAndPhis.size(); ++k)
-        {
-          dualElem->set_node(k, dualNodesAndPhis[k].first);
-          dualNodesAndPhis[k].first->print_info();
-          _console << "With PHI = " << dualNodesAndPhis[k].second / 3.14159265357 << "*pi"
-                   << std::endl;
-        }*/
       }
     }
     std::sort(dualNodesAndPhis.begin(),
