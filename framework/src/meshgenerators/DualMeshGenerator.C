@@ -167,9 +167,11 @@ DualMeshGenerator::generate()
   triangulator.triangulation_type() = libMesh::TriangulatorInterface::PSLG;
   triangulator.minimum_angle() = 0;
   triangulator.desired_area() = 0;
-  triangulator.triangulate();
+
   triangulator.insert_extra_points() = false;
   triangulator.smooth_after_generating() = false;
+
+  triangulator.triangulate();
 
   std::vector<Point> circumcenters;
   std::unordered_map<dof_id_type, std::vector<dof_id_type>> node_to_circumcenter_ids;
@@ -368,6 +370,14 @@ DualMeshGenerator::generate()
         tri->set_node(0, vertex_node);
         tri->set_node(1, fan_nodes[i]);
         tri->set_node(2, fan_nodes[i + 1]);
+
+        if (tri->is_flipped())
+        {
+          tri->set_node(1, fan_nodes[i + 1]);
+          tri->set_node(2, fan_nodes[i]);
+        }
+
+        libmesh_assert(!tri->is_flipped());
         dualMesh->add_elem(std::move(tri));
       }
     }
@@ -377,7 +387,7 @@ DualMeshGenerator::generate()
 
       for (unsigned int i = 0; i < nodes_and_phis.size(); ++i)
         dual_elem->set_node(i, nodes_and_phis[i].first);
-
+      libmesh_assert(!dual_elem->is_flipped());
       dualMesh->add_elem(std::move(dual_elem));
     }
   }
