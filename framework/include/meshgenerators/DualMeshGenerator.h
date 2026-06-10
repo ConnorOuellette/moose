@@ -23,6 +23,12 @@ public:
 
   Point circumcenter(const Elem * elem);
 
+  std::vector<Point> clipPolygonToElem(const std::vector<Point> & poly, const Elem * elem);
+
+  std::vector<Point>
+  clipPolygonToPhysicalBoundary(const std::vector<Point> & poly,
+                                const std::vector<std::pair<Point, Point>> & boundary_segments);
+
   std::unique_ptr<MeshBase> generate() override;
 
 protected:
