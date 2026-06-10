@@ -41,6 +41,16 @@
 
     requirement = 'The system shall have the capability to generate a dual mesh from an input mesh with a concave boundary.'
   []
+  [concave_primal]
+    type = 'Exodiff'
+    input = 'concave_primal.i'
+    cli_args = '--mesh-only'
+    exodiff = 'concave_primal_in.e'
+    mesh_mode = 'REPLICATED'
+    recover = false
+
+    requirement = 'Primal concave mesh for comparison to concave_dual.'
+  []
   [concentric_dual]
     type = 'Exodiff'
     input = 'concentric_dual.i'
