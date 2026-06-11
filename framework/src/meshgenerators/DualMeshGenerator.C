@@ -36,6 +36,8 @@ DualMeshGenerator::validParams()
                         1e-12,
                         "Tolerance (square of scalar distance) for determining whether polygon "
                         "vertices lie within or outside boundaries.");
+  params.addParam<Real>(
+      "dual_node_merge_tol", 1e-2, "Tolerance for metging nearly coincident circumcenters");
   return params;
 }
 
@@ -43,7 +45,8 @@ DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
   : MeshGenerator(parameters),
     _input(getMesh("input")),
     _boundary_node_angular_tol(getParam<Real>("boundary_node_angular_tol")),
-    _boundary_edge_outside_tol(getParam<Real>("boundary_edge_outside_tol"))
+    _boundary_edge_outside_tol(getParam<Real>("boundary_edge_outside_tol")),
+    _dual_node_merge_tol(getParam<Real>("dual_node_merge_tol"))
 {
 }
 
@@ -262,6 +265,19 @@ DualMeshGenerator::generate()
 
   auto dualMesh = buildReplicatedMesh(2);
 
+  std::vector<Node *> dual_nodes;
+
+  auto add_or_get_dual_node = [&](const Point & p) -> Node *
+  {
+    for (Node * node : dual_nodes)
+      if ((*node - p).norm() <= _dual_node_merge_tol)
+        return node;
+
+    Node * new_node = dualMesh->add_point(p);
+    dual_nodes.push_back(new_node);
+    return new_node;
+  };
+
   for (const auto & [primalNodeID, circumcenterIDs] : node_to_circumcenter_ids)
   {
     const Point & primal_point = *tri_mesh->node_ptr(primalNodeID);
@@ -287,7 +303,7 @@ DualMeshGenerator::generate()
     auto dual_elem = std::make_unique<libMesh::C0Polygon>(polygon_points.size());
 
     for (unsigned int i = 0; i < polygon_points.size(); ++i)
-      dual_elem->set_node(i, dualMesh->add_point(polygon_points[i]));
+      dual_elem->set_node(i, add_or_get_dual_node(polygon_points[i]));
 
     libmesh_assert(!dual_elem->is_flipped());
     dualMesh->add_elem(std::move(dual_elem));

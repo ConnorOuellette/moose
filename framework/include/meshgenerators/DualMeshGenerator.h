@@ -39,4 +39,6 @@ protected:
 
   // Vertex tolerance for determining if vertices are inside/outside of a boundary
   Real _boundary_edge_outside_tol;
+
+  Real _dual_node_merge_tol;
 };
