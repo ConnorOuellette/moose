@@ -36,4 +36,7 @@ protected:
 
   /// Vertex tolerance for determining colinearity of adjacent sides
   Real _boundary_node_angular_tol;
+
+  // Vertex tolerance for determining if vertices are inside/outside of a boundary
+  Real _boundary_edge_outside_tol;
 };
