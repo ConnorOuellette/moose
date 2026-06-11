@@ -37,7 +37,7 @@ DualMeshGenerator::validParams()
                         "Tolerance (square of scalar distance) for determining whether polygon "
                         "vertices lie within or outside boundaries.");
   params.addParam<Real>(
-      "dual_node_merge_tol", 1e-2, "Tolerance for metging nearly coincident circumcenters");
+      "dual_node_merge_tol", 1e-2, "Tolerance for merging nearly identical circumcenters");
   return params;
 }
 
@@ -177,6 +177,20 @@ DualMeshGenerator::clipPolygonToPhysicalBoundary(
   return output;
 }
 
+// True only when two triangles share a full edge.
+static bool
+trianglesShareTwoNodes(const Elem * a, const Elem * b)
+{
+  unsigned int shared_nodes = 0;
+
+  for (unsigned int i = 0; i < a->n_nodes(); ++i)
+    for (unsigned int j = 0; j < b->n_nodes(); ++j)
+      if (a->node_id(i) == b->node_id(j))
+        ++shared_nodes;
+
+  return shared_nodes == 2;
+}
+
 /// @brief
 /// @return
 std::unique_ptr<MeshBase>
@@ -248,65 +262,151 @@ DualMeshGenerator::generate()
 
   triangulator.triangulate();
 
-  std::vector<Point> circumcenters;
-  std::unordered_map<dof_id_type, std::vector<dof_id_type>> node_to_circumcenter_ids;
+  struct CircumcenterRecord
+  {
+    Point point;
+    std::vector<const Elem *> triangles;
+  };
 
+  std::vector<CircumcenterRecord> circumcenter_records;
+  std::unordered_map<dof_id_type, dof_id_type> tri_elem_to_cc_id;
+  std::unordered_map<dof_id_type, std::vector<const Elem *>> primal_node_to_triangles;
+
+  // Compute and consolidate triangle circumcenters.
   for (const auto & tri_elem : tri_mesh->element_ptr_range())
   {
     if (tri_elem->n_vertices() != 3)
       continue;
 
-    const dof_id_type circumcenter_id = circumcenters.size();
-    circumcenters.push_back(circumcenter(tri_elem));
+    const Point cc = circumcenter(tri_elem);
+
+    dof_id_type cc_id = libMesh::invalid_uint;
+
+    for (const auto i : index_range(circumcenter_records))
+      if ((circumcenter_records[i].point - cc).norm() <= _dual_node_merge_tol)
+      {
+        cc_id = i;
+        break;
+      }
+
+    if (cc_id == libMesh::invalid_uint)
+    {
+      cc_id = circumcenter_records.size();
+      circumcenter_records.push_back({cc, {}});
+    }
+
+    circumcenter_records[cc_id].triangles.push_back(tri_elem);
+    tri_elem_to_cc_id[tri_elem->id()] = cc_id;
 
     for (const auto n : make_range(tri_elem->n_nodes()))
-      node_to_circumcenter_ids[tri_elem->node_id(n)].push_back(circumcenter_id);
+      primal_node_to_triangles[tri_elem->node_id(n)].push_back(tri_elem);
   }
 
   auto dualMesh = buildReplicatedMesh(2);
 
-  std::vector<Node *> dual_nodes;
-
-  auto add_or_get_dual_node = [&](const Point & p) -> Node *
+  // Build one dual element around each primal node.
+  for (const auto & [primal_node_id, incident_tris] : primal_node_to_triangles)
   {
-    for (Node * node : dual_nodes)
-      if ((*node - p).norm() <= _dual_node_merge_tol)
-        return node;
+    // Connect incident triangles only if they share a full edge.
+    std::vector<std::vector<unsigned int>> adjacency(incident_tris.size());
 
-    Node * new_node = dualMesh->add_point(p);
-    dual_nodes.push_back(new_node);
-    return new_node;
-  };
+    for (unsigned int i = 0; i < incident_tris.size(); ++i)
+      for (unsigned int j = i + 1; j < incident_tris.size(); ++j)
+        if (trianglesShareTwoNodes(incident_tris[i], incident_tris[j]))
+        {
+          adjacency[i].push_back(j);
+          adjacency[j].push_back(i);
+        }
 
-  for (const auto & [primalNodeID, circumcenterIDs] : node_to_circumcenter_ids)
-  {
-    const Point & primal_point = *tri_mesh->node_ptr(primalNodeID);
+    // Start at an endpoint for boundary chains, otherwise start anywhere.
+    unsigned int start = 0;
 
-    std::vector<Point> polygon_points;
-    polygon_points.reserve(circumcenterIDs.size());
+    for (unsigned int i = 0; i < adjacency.size(); ++i)
+      if (adjacency[i].size() == 1)
+      {
+        start = i;
+        break;
+      }
 
-    for (const auto circumcenter_id : circumcenterIDs)
-      polygon_points.push_back(circumcenters[circumcenter_id]);
+    std::vector<bool> used(incident_tris.size(), false);
+    std::vector<dof_id_type> ordered_cc_ids;
 
-    std::sort(polygon_points.begin(),
-              polygon_points.end(),
-              [&](const Point & a, const Point & b)
-              {
-                const Real phi_a = std::atan2(a(1) - primal_point(1), a(0) - primal_point(0));
-                const Real phi_b = std::atan2(b(1) - primal_point(1), b(0) - primal_point(0));
-                return phi_a < phi_b;
-              });
+    unsigned int current = start;
+    unsigned int previous = libMesh::invalid_uint;
 
-    if (polygon_points.size() < 3)
+    // Walk triangle adjacency to collect circumcenters in connected order.
+    while (true)
+    {
+      const Elem * tri = incident_tris[current];
+
+      auto it = tri_elem_to_cc_id.find(tri->id());
+      if (it != tri_elem_to_cc_id.end())
+      {
+        const dof_id_type cc_id = it->second;
+
+        if (std::find(ordered_cc_ids.begin(), ordered_cc_ids.end(), cc_id) == ordered_cc_ids.end())
+          ordered_cc_ids.push_back(cc_id);
+      }
+
+      used[current] = true;
+
+      unsigned int next = libMesh::invalid_uint;
+
+      for (const auto candidate : adjacency[current])
+        if (candidate != previous && !used[candidate])
+        {
+          next = candidate;
+          break;
+        }
+
+      if (next == libMesh::invalid_uint)
+        break;
+
+      previous = current;
+      current = next;
+    }
+
+    if (ordered_cc_ids.size() < 3)
       continue;
 
-    auto dual_elem = std::make_unique<libMesh::C0Polygon>(polygon_points.size());
+    Point dual_centroid;
 
-    for (unsigned int i = 0; i < polygon_points.size(); ++i)
-      dual_elem->set_node(i, add_or_get_dual_node(polygon_points[i]));
+    for (const auto cc_id : ordered_cc_ids)
+      dual_centroid += circumcenter_records[cc_id].point;
 
-    libmesh_assert(!dual_elem->is_flipped());
-    dualMesh->add_elem(std::move(dual_elem));
+    dual_centroid /= ordered_cc_ids.size();
+
+    std::sort(ordered_cc_ids.begin(),
+              ordered_cc_ids.end(),
+              [&](const dof_id_type a, const dof_id_type b)
+              {
+                const Point & pa = circumcenter_records[a].point;
+                const Point & pb = circumcenter_records[b].point;
+
+                return std::atan2(pa(1) - dual_centroid(1), pa(0) - dual_centroid(0)) <
+                       std::atan2(pb(1) - dual_centroid(1), pb(0) - dual_centroid(0));
+              });
+
+    auto dual_elem = std::make_unique<libMesh::C0Polygon>(ordered_cc_ids.size());
+
+    for (unsigned int i = 0; i < ordered_cc_ids.size(); ++i)
+      dual_elem->set_node(i, dualMesh->add_point(circumcenter_records[ordered_cc_ids[i]].point));
+
+    if (dual_elem->is_flipped())
+    {
+      auto reversed_elem = std::make_unique<libMesh::C0Polygon>(ordered_cc_ids.size());
+
+      for (unsigned int i = 0; i < ordered_cc_ids.size(); ++i)
+        reversed_elem->set_node(
+            i,
+            dualMesh->add_point(
+                circumcenter_records[ordered_cc_ids[ordered_cc_ids.size() - 1 - i]].point));
+
+      dual_elem = std::move(reversed_elem);
+    }
+
+    if (!dual_elem->is_flipped())
+      dualMesh->add_elem(std::move(dual_elem));
   }
 
   dualMesh->unset_is_prepared();
