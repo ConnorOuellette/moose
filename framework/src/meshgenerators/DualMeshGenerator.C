@@ -413,5 +413,5 @@ DualMeshGenerator::generate()
   tri_mesh->unset_is_prepared();
 
   return dynamic_pointer_cast<MeshBase>(dualMesh);
-  //  return dynamic_pointer_cast<MeshBase>(tri_mesh);
+  // return dynamic_pointer_cast<MeshBase>(tri_mesh);
 }
