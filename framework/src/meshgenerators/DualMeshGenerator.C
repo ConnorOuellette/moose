@@ -91,6 +91,29 @@ trianglesShareTwoNodes(const Elem * a, const Elem * b)
   return shared_nodes == 2;
 }
 
+static Real
+cross2D(const Point & a, const Point & b, const Point & c)
+{
+  return (b(0) - a(0)) * (c(1) - a(1)) - (b(1) - a(1)) * (c(0) - a(0));
+}
+
+static Point
+lineIntersection(const Point & p0, const Point & p1, const Point & q0, const Point & q1)
+{
+  const Point r = p1 - p0;
+  const Point s = q1 - q0;
+
+  const Real denom = r(0) * s(1) - r(1) * s(0);
+
+  if (std::abs(denom) < 1e-14)
+    return p1;
+
+  const Point qp = q0 - p0;
+  const Real t = (qp(0) * s(1) - qp(1) * s(0)) / denom;
+
+  return p0 + t * r;
+}
+
 /// @brief
 /// @return
 std::unique_ptr<MeshBase>
@@ -98,11 +121,32 @@ DualMeshGenerator::generate()
 {
   const auto input_mesh = std::move(_input);
 
+  if (input_mesh->mesh_dimension() != 2)
+    mooseError("DualMeshGenerator currently only supports 2D Meshes");
+
   auto tri_mesh = buildReplicatedMesh(2);
+
+  std::unordered_set<dof_id_type> real_node_ids;
+  std::vector<std::pair<Point, Point>> physical_boundary_segments;
+
+  for (const auto & elem : input_mesh->element_ptr_range())
+  {
+    for (const auto side : elem->side_index_range())
+    {
+      if (elem->neighbor_ptr(side) == nullptr)
+      {
+        auto side_elem = elem->build_side_ptr(side);
+
+        if (side_elem->n_nodes() == 2)
+          physical_boundary_segments.push_back({side_elem->point(0), side_elem->point(1)});
+      }
+    }
+  }
 
   for (const auto & node : input_mesh->node_ptr_range())
   {
     Node * new_node = tri_mesh->add_point(*node);
+    real_node_ids.insert(new_node->id());
 
     auto node_elem = std::make_unique<NodeElem>();
     node_elem->set_node(0) = new_node;
@@ -160,10 +204,59 @@ DualMeshGenerator::generate()
 
   auto dualMesh = buildReplicatedMesh(2);
 
+  // For clipping to physical boundary
+  Point domain_center;
+
+  for (const auto & node : input_mesh->node_ptr_range())
+    domain_center += *node;
+
+  domain_center /= input_mesh->n_nodes();
+
+  auto clipToPhysicalBoundary = [&](std::vector<Point> poly)
+  {
+    for (const auto & segment : physical_boundary_segments)
+    {
+      Point a = segment.first;
+      Point b = segment.second;
+
+      // Orient boundary segment so the physical domain is on the left.
+      if (cross2D(a, b, domain_center) < 0.0)
+        std::swap(a, b);
+
+      std::vector<Point> input = poly;
+      poly.clear();
+
+      if (input.empty())
+        break;
+
+      Point prev = input.back();
+      bool prev_inside = cross2D(a, b, prev) >= -1e-12;
+
+      for (const auto & curr : input)
+      {
+        const bool curr_inside = cross2D(a, b, curr) >= -1e-12;
+
+        if (curr_inside)
+        {
+          if (!prev_inside)
+            poly.push_back(lineIntersection(prev, curr, a, b));
+
+          poly.push_back(curr);
+        }
+        else if (prev_inside)
+          poly.push_back(lineIntersection(prev, curr, a, b));
+
+        prev = curr;
+        prev_inside = curr_inside;
+      }
+    }
+
+    return poly;
+  };
+
   // Build one dual element around each primal node.
   for (const auto & [primal_node_id, incident_tris] : primal_node_to_triangles)
   {
-    // Connect incident triangles only if they share a full edge.
     std::vector<std::vector<unsigned int>> adjacency(incident_tris.size());
 
     for (unsigned int i = 0; i < incident_tris.size(); ++i)
@@ -225,18 +318,28 @@ DualMeshGenerator::generate()
     if (ordered_cc_ids.size() < 3)
       continue;
 
-    auto dual_elem = std::make_unique<libMesh::C0Polygon>(ordered_cc_ids.size());
+    std::vector<Point> clipped_points;
 
-    for (unsigned int i = 0; i < ordered_cc_ids.size(); ++i)
-      dual_elem->set_node(i, dualMesh->add_point(circumcenters[ordered_cc_ids[i]]));
+    for (const auto cc_id : ordered_cc_ids)
+      clipped_points.push_back(circumcenters[cc_id]);
+
+    clipped_points = clipToPhysicalBoundary(clipped_points);
+
+    if (clipped_points.size() < 3)
+      continue;
+
+    auto dual_elem = std::make_unique<libMesh::C0Polygon>(clipped_points.size());
+
+    for (unsigned int i = 0; i < clipped_points.size(); ++i)
+      dual_elem->set_node(i, dualMesh->add_point(clipped_points[i]));
 
     if (dual_elem->is_flipped())
     {
-      auto reversed_elem = std::make_unique<libMesh::C0Polygon>(ordered_cc_ids.size());
+      auto reversed_elem = std::make_unique<libMesh::C0Polygon>(clipped_points.size());
 
-      for (unsigned int i = 0; i < ordered_cc_ids.size(); ++i)
-        reversed_elem->set_node(
-            i, dualMesh->add_point(circumcenters[ordered_cc_ids[ordered_cc_ids.size() - 1 - i]]));
+      for (unsigned int i = 0; i < clipped_points.size(); ++i)
+        reversed_elem->set_node(i,
+                                dualMesh->add_point(clipped_points[clipped_points.size() - 1 - i]));
 
       dual_elem = std::move(reversed_elem);
     }
