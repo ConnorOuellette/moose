@@ -262,13 +262,7 @@ DualMeshGenerator::generate()
 
   triangulator.triangulate();
 
-  struct CircumcenterRecord
-  {
-    Point point;
-    std::vector<const Elem *> triangles;
-  };
-
-  std::vector<CircumcenterRecord> circumcenter_records;
+  std::vector<Point> circumcenters;
   std::unordered_map<dof_id_type, dof_id_type> tri_elem_to_cc_id;
   std::unordered_map<dof_id_type, std::vector<const Elem *>> primal_node_to_triangles;
 
@@ -278,24 +272,9 @@ DualMeshGenerator::generate()
     if (tri_elem->n_vertices() != 3)
       continue;
 
-    const Point cc = circumcenter(tri_elem);
+    const dof_id_type cc_id = circumcenters.size();
 
-    dof_id_type cc_id = libMesh::invalid_uint;
-
-    for (const auto i : index_range(circumcenter_records))
-      if ((circumcenter_records[i].point - cc).norm() <= _dual_node_merge_tol)
-      {
-        cc_id = i;
-        break;
-      }
-
-    if (cc_id == libMesh::invalid_uint)
-    {
-      cc_id = circumcenter_records.size();
-      circumcenter_records.push_back({cc, {}});
-    }
-
-    circumcenter_records[cc_id].triangles.push_back(tri_elem);
+    circumcenters.push_back(circumcenter(tri_elem));
     tri_elem_to_cc_id[tri_elem->id()] = cc_id;
 
     for (const auto n : make_range(tri_elem->n_nodes()))
@@ -372,7 +351,7 @@ DualMeshGenerator::generate()
     Point dual_centroid;
 
     for (const auto cc_id : ordered_cc_ids)
-      dual_centroid += circumcenter_records[cc_id].point;
+      dual_centroid += circumcenters[cc_id];
 
     dual_centroid /= ordered_cc_ids.size();
 
@@ -380,8 +359,8 @@ DualMeshGenerator::generate()
               ordered_cc_ids.end(),
               [&](const dof_id_type a, const dof_id_type b)
               {
-                const Point & pa = circumcenter_records[a].point;
-                const Point & pb = circumcenter_records[b].point;
+                const Point & pa = circumcenters[a];
+                const Point & pb = circumcenters[b];
 
                 return std::atan2(pa(1) - dual_centroid(1), pa(0) - dual_centroid(0)) <
                        std::atan2(pb(1) - dual_centroid(1), pb(0) - dual_centroid(0));
@@ -390,7 +369,7 @@ DualMeshGenerator::generate()
     auto dual_elem = std::make_unique<libMesh::C0Polygon>(ordered_cc_ids.size());
 
     for (unsigned int i = 0; i < ordered_cc_ids.size(); ++i)
-      dual_elem->set_node(i, dualMesh->add_point(circumcenter_records[ordered_cc_ids[i]].point));
+      dual_elem->set_node(i, dualMesh->add_point(circumcenters[ordered_cc_ids[i]]));
 
     if (dual_elem->is_flipped())
     {
@@ -398,9 +377,7 @@ DualMeshGenerator::generate()
 
       for (unsigned int i = 0; i < ordered_cc_ids.size(); ++i)
         reversed_elem->set_node(
-            i,
-            dualMesh->add_point(
-                circumcenter_records[ordered_cc_ids[ordered_cc_ids.size() - 1 - i]].point));
+            i, dualMesh->add_point(circumcenters[ordered_cc_ids[ordered_cc_ids.size() - 1 - i]]));
 
       dual_elem = std::move(reversed_elem);
     }
