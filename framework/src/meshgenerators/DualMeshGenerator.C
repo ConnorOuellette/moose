@@ -10,7 +10,6 @@
 #include "DualMeshGenerator.h"
 #include "Conversion.h"
 #include "CastUniquePointer.h"
-#include "MooseUtils.h"
 #include "MooseMeshUtils.h"
 #include "libmesh/node_elem.h"
 #include "libmesh/poly2tri_triangulator.h"
@@ -27,26 +26,11 @@ DualMeshGenerator::validParams()
   params.addClassDescription("Takes a 2D mesh as input and returns a Voronoi dual mesh, i.e.,"
                              "changes each input mode into an element and each input element "
                              "into a node located at its circumcenter.");
-
-  params.addParam<Real>("boundary_node_angular_tol",
-                        1,
-                        "Tolerance (in degrees) for determining colinearity of boundary sides"
-                        "when finding input mesh vertices.");
-  params.addParam<Real>("boundary_edge_outside_tol",
-                        1e-12,
-                        "Tolerance (square of scalar distance) for determining whether polygon "
-                        "vertices lie within or outside boundaries.");
-  params.addParam<Real>(
-      "dual_node_merge_tol", 1e-2, "Tolerance for merging nearly identical circumcenters");
   return params;
 }
 
 DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
-  : MeshGenerator(parameters),
-    _input(getMesh("input")),
-    _boundary_node_angular_tol(getParam<Real>("boundary_node_angular_tol")),
-    _boundary_edge_outside_tol(getParam<Real>("boundary_edge_outside_tol")),
-    _dual_node_merge_tol(getParam<Real>("dual_node_merge_tol"))
+  : MeshGenerator(parameters), _input(getMesh("input"))
 {
 }
 
@@ -54,9 +38,6 @@ DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
 Point
 DualMeshGenerator::circumcenter(const Elem * elem)
 {
-  if (_boundary_edge_outside_tol < 0)
-    mooseError("boundary_edge_outside_tol must be a positive value");
-
   const unsigned int n = elem->n_vertices();
   libmesh_assert_greater(n, 2);
 
@@ -93,88 +74,7 @@ DualMeshGenerator::circumcenter(const Elem * elem)
 
   Point cc(cx, cy, 0.0);
 
-  // Check whether circumcenter is inside polygon using ray casting.
-  bool inside = false;
-
-  for (unsigned int i = 0, j = n - 1; i < n; j = i++)
-  {
-    const Point & pi = elem->point(i);
-    const Point & pj = elem->point(j);
-
-    const bool intersects = ((pi(1) > cc(1)) != (pj(1) > cc(1))) &&
-                            (cc(0) < (pj(0) - pi(0)) * (cc(1) - pi(1)) / (pj(1) - pi(1)) + pi(0));
-
-    if (intersects)
-      inside = !inside;
-  }
-
   return cc;
-}
-
-static Real
-cross2D(const Point & a, const Point & b, const Point & c)
-{
-  return (b(0) - a(0)) * (c(1) - a(1)) - (b(1) - a(1)) * (c(0) - a(0));
-}
-
-static Point
-lineIntersection(const Point & p0, const Point & p1, const Point & q0, const Point & q1)
-{
-  const Point r = p1 - p0;
-  const Point s = q1 - q0;
-
-  const Real denom = r(0) * s(1) - r(1) * s(0);
-
-  if (std::abs(denom) < 1e-14)
-    return p1;
-
-  const Point qp = q0 - p0;
-  const Real t = (qp(0) * s(1) - qp(1) * s(0)) / denom;
-
-  return p0 + t * r;
-}
-
-std::vector<Point>
-DualMeshGenerator::clipPolygonToPhysicalBoundary(
-    const std::vector<Point> & poly, const std::vector<std::pair<Point, Point>> & boundary_segments)
-{
-  std::vector<Point> output = poly;
-
-  // Removing polygon vertices that end up outside of the boundary of the primal mesh
-  for (const auto & segment : boundary_segments)
-  {
-    const Point & a = segment.first;
-    const Point & b = segment.second;
-
-    std::vector<Point> input = output;
-    output.clear();
-
-    if (input.empty())
-      break;
-
-    Point prev = input.back();
-    bool prev_inside = cross2D(a, b, prev) >= -_boundary_edge_outside_tol;
-
-    for (const Point & curr : input)
-    {
-      const bool curr_inside = cross2D(a, b, curr) >= -_boundary_edge_outside_tol;
-
-      if (curr_inside)
-      {
-        if (!prev_inside)
-          output.push_back(lineIntersection(prev, curr, a, b));
-
-        output.push_back(curr);
-      }
-      else if (prev_inside)
-        output.push_back(lineIntersection(prev, curr, a, b));
-
-      prev = curr;
-      prev_inside = curr_inside;
-    }
-  }
-
-  return output;
 }
 
 // True only when two triangles share a full edge.
@@ -200,32 +100,9 @@ DualMeshGenerator::generate()
 
   auto tri_mesh = buildReplicatedMesh(2);
 
-  std::vector<std::pair<Point, Point>> physical_boundary_segments;
-  std::unordered_map<dof_id_type, Node *> old_to_new_node;
-  std::unordered_set<dof_id_type> real_node_ids;
-  std::unordered_set<dof_id_type> boundary_node_ids;
-
-  for (const auto & elem : input_mesh->element_ptr_range())
-    for (const auto side : elem->side_index_range())
-      if (elem->neighbor_ptr(side) == nullptr)
-      {
-        auto side_elem = elem->build_side_ptr(side);
-
-        if (side_elem->n_nodes() == 2)
-        {
-          const auto old0 = side_elem->node_id(0);
-          const auto old1 = side_elem->node_id(1);
-
-          physical_boundary_segments.push_back({side_elem->point(0), side_elem->point(1)});
-        }
-      }
-
   for (const auto & node : input_mesh->node_ptr_range())
   {
     Node * new_node = tri_mesh->add_point(*node);
-
-    old_to_new_node[node->id()] = new_node;
-    real_node_ids.insert(new_node->id());
 
     auto node_elem = std::make_unique<NodeElem>();
     node_elem->set_node(0) = new_node;
@@ -266,7 +143,7 @@ DualMeshGenerator::generate()
   std::unordered_map<dof_id_type, dof_id_type> tri_elem_to_cc_id;
   std::unordered_map<dof_id_type, std::vector<const Elem *>> primal_node_to_triangles;
 
-  // Compute and consolidate triangle circumcenters.
+  // Compute triangle circumcenters.
   for (const auto & tri_elem : tri_mesh->element_ptr_range())
   {
     if (tri_elem->n_vertices() != 3)
@@ -348,24 +225,6 @@ DualMeshGenerator::generate()
     if (ordered_cc_ids.size() < 3)
       continue;
 
-    Point dual_centroid;
-
-    for (const auto cc_id : ordered_cc_ids)
-      dual_centroid += circumcenters[cc_id];
-
-    dual_centroid /= ordered_cc_ids.size();
-
-    std::sort(ordered_cc_ids.begin(),
-              ordered_cc_ids.end(),
-              [&](const dof_id_type a, const dof_id_type b)
-              {
-                const Point & pa = circumcenters[a];
-                const Point & pb = circumcenters[b];
-
-                return std::atan2(pa(1) - dual_centroid(1), pa(0) - dual_centroid(0)) <
-                       std::atan2(pb(1) - dual_centroid(1), pb(0) - dual_centroid(0));
-              });
-
     auto dual_elem = std::make_unique<libMesh::C0Polygon>(ordered_cc_ids.size());
 
     for (unsigned int i = 0; i < ordered_cc_ids.size(); ++i)
@@ -387,8 +246,6 @@ DualMeshGenerator::generate()
   }
 
   dualMesh->unset_is_prepared();
-  tri_mesh->unset_is_prepared();
 
   return dynamic_pointer_cast<MeshBase>(dualMesh);
-  // return dynamic_pointer_cast<MeshBase>(tri_mesh);
 }
