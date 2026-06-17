@@ -12,12 +12,15 @@
 #include "CastUniquePointer.h"
 #include "MooseMeshUtils.h"
 #include "libmesh/cell_c0polyhedron.h"
+#include "libmesh/cell_tet4.h"
 #include "libmesh/face_c0polygon.h"
+#include "libmesh/libmesh_exceptions.h"
 #include "libmesh/node_elem.h"
 #include "libmesh/poly2tri_triangulator.h"
 #include "libmesh/elem.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 
@@ -243,6 +246,284 @@ hasNonzeroArea3D(const std::vector<Point> & points, const Real tol = 1e-12)
   return false;
 }
 
+static Real
+tetVolume6(const Point & a, const Point & b, const Point & c, const Point & d)
+{
+  return (b - a).cross(c - a) * (d - a);
+}
+
+static bool
+pointOnTriangle3D(
+    const Point & point, const Point & a, const Point & b, const Point & c, const Real tol = 1e-10)
+{
+  const Point normal = (b - a).cross(c - a);
+
+  if (normal.norm() <= tol)
+    return false;
+
+  if (std::abs(normal * (point - a)) > tol * normal.norm())
+    return false;
+
+  const Point v0 = c - a;
+  const Point v1 = b - a;
+  const Point v2 = point - a;
+
+  const Real dot00 = v0 * v0;
+  const Real dot01 = v0 * v1;
+  const Real dot02 = v0 * v2;
+  const Real dot11 = v1 * v1;
+  const Real dot12 = v1 * v2;
+  const Real denominator = dot00 * dot11 - dot01 * dot01;
+
+  if (std::abs(denominator) <= tol)
+    return false;
+
+  const Real u = (dot11 * dot02 - dot01 * dot12) / denominator;
+  const Real v = (dot00 * dot12 - dot01 * dot02) / denominator;
+
+  return u >= -tol && v >= -tol && u + v <= 1.0 + tol;
+}
+
+static bool
+rayTriangleIntersection3D(const Point & origin,
+                          const Point & direction,
+                          const Point & a,
+                          const Point & b,
+                          const Point & c,
+                          Real & t,
+                          const Real tol = 1e-10)
+{
+  const Point edge1 = b - a;
+  const Point edge2 = c - a;
+  const Point h = direction.cross(edge2);
+  const Real determinant = edge1 * h;
+
+  if (std::abs(determinant) <= tol)
+    return false;
+
+  const Real inverse_determinant = 1.0 / determinant;
+  const Point s = origin - a;
+  const Real u = inverse_determinant * (s * h);
+
+  if (u < -tol || u > 1.0 + tol)
+    return false;
+
+  const Point q = s.cross(edge1);
+  const Real v = inverse_determinant * (direction * q);
+
+  if (v < -tol || u + v > 1.0 + tol)
+    return false;
+
+  t = inverse_determinant * (edge2 * q);
+  return t > tol;
+}
+
+static bool
+pointInsideTriangulatedSurface3D(const Point & point,
+                                 const std::vector<std::vector<Point>> & triangles,
+                                 const Real tol = 1e-10)
+{
+  for (const auto & triangle : triangles)
+    if (pointOnTriangle3D(point, triangle[0], triangle[1], triangle[2], tol))
+      return true;
+
+  const Point direction(0.8728715609439696, 0.4364357804719848, 0.2182178902359924);
+  std::vector<Real> intersections;
+
+  for (const auto & triangle : triangles)
+  {
+    Real t = 0.0;
+
+    if (!rayTriangleIntersection3D(point, direction, triangle[0], triangle[1], triangle[2], t, tol))
+      continue;
+
+    bool duplicate_intersection = false;
+
+    for (const auto existing_t : intersections)
+      if (std::abs(existing_t - t) <= tol)
+      {
+        duplicate_intersection = true;
+        break;
+      }
+
+    if (!duplicate_intersection)
+      intersections.push_back(t);
+  }
+
+  return intersections.size() % 2 == 1;
+}
+
+static void
+addSidePoints3D(std::vector<std::vector<Point>> & sides,
+                const std::vector<Point> & side_points,
+                const bool triangulate = false,
+                const Real tol = 1e-12)
+{
+  std::vector<Point> unique_side_points;
+
+  for (const auto & point : side_points)
+    addUniquePoint(unique_side_points, point, tol);
+
+  if (unique_side_points.size() < 3 || !hasNonzeroArea3D(unique_side_points, tol))
+    return;
+
+  if (triangulate && unique_side_points.size() > 3)
+  {
+    for (std::size_t i = 1; i + 1 < unique_side_points.size(); ++i)
+    {
+      const std::vector<Point> triangle_points = {
+          unique_side_points[0], unique_side_points[i], unique_side_points[i + 1]};
+
+      if (hasNonzeroArea3D(triangle_points, tol))
+        sides.push_back(triangle_points);
+    }
+
+    return;
+  }
+
+  sides.push_back(unique_side_points);
+}
+
+static Point
+faceNormal3D(const std::vector<Point> & points, const Real tol = 1e-12)
+{
+  for (std::size_t i = 0; i < points.size(); ++i)
+    for (std::size_t j = i + 1; j < points.size(); ++j)
+      for (std::size_t k = j + 1; k < points.size(); ++k)
+      {
+        const Point normal = (points[j] - points[i]).cross(points[k] - points[i]);
+
+        if (normal.norm() > tol)
+          return normal;
+      }
+
+  return Point();
+}
+
+static bool
+isConvexPolyhedron3D(const std::vector<std::vector<Point>> & sides, const Real tol = 1e-10)
+{
+  if (sides.size() < 4)
+    return false;
+
+  std::vector<Point> points;
+
+  for (const auto & side : sides)
+    for (const auto & point : side)
+      addUniquePoint(points, point, tol);
+
+  if (points.size() < 4)
+    return false;
+
+  Point center;
+
+  for (const auto & point : points)
+    center += point;
+
+  center /= points.size();
+
+  for (const auto & side : sides)
+  {
+    if (side.size() < 3)
+      return false;
+
+    const Point normal = faceNormal3D(side, tol);
+
+    if (normal.norm() <= tol)
+      return false;
+
+    Point outward_normal = normal;
+
+    if (normal * (center - side[0]) > tol)
+      outward_normal = -1.0 * normal;
+
+    for (const auto & point : points)
+    {
+      const Point offset = point - side[0];
+
+      if (outward_normal * offset > tol * std::max(Real(1.0), offset.norm()))
+        return false;
+    }
+  }
+
+  return true;
+}
+
+static void
+addUniqueDirection3D(std::vector<Point> & directions,
+                     const Point & direction,
+                     const Real tol = 1e-8)
+{
+  if (direction.norm() <= tol)
+    return;
+
+  const Point unit_direction = direction / direction.norm();
+
+  for (const auto & existing_direction : directions)
+    if ((unit_direction - existing_direction).norm() <= tol)
+      return;
+
+  directions.push_back(unit_direction);
+}
+
+static std::vector<Point>
+sortPointsAroundAxis3D(const std::vector<Point> & unsorted_points,
+                       const Point & axis,
+                       const Real tol = 1e-12)
+{
+  std::vector<Point> points;
+
+  for (const auto & point : unsorted_points)
+    addUniquePoint(points, point, tol);
+
+  if (points.size() < 3 || axis.norm() <= tol)
+    return points;
+
+  const Point axis_unit = axis / axis.norm();
+  Point reference = std::abs(axis_unit(0)) < 0.9 ? Point(1.0, 0.0, 0.0) : Point(0.0, 1.0, 0.0);
+  Point e1 = reference - (reference * axis_unit) * axis_unit;
+
+  if (e1.norm() <= tol)
+  {
+    reference = Point(0.0, 0.0, 1.0);
+    e1 = reference - (reference * axis_unit) * axis_unit;
+  }
+
+  if (e1.norm() <= tol)
+    return points;
+
+  e1 /= e1.norm();
+
+  Point e2 = axis_unit.cross(e1);
+
+  if (e2.norm() <= tol)
+    return points;
+
+  e2 /= e2.norm();
+
+  Point center;
+
+  for (const auto & point : points)
+    center += point;
+
+  center /= points.size();
+
+  std::sort(points.begin(),
+            points.end(),
+            [&center, &e1, &e2](const Point & a, const Point & b)
+            {
+              const Point da = a - center;
+              const Point db = b - center;
+
+              return std::atan2(da * e2, da * e1) < std::atan2(db * e2, db * e1);
+            });
+
+  if (axis * faceNormal3D(points) < 0.0)
+    std::reverse(points.begin(), points.end());
+
+  return points;
+}
+
 std::unique_ptr<MeshBase>
 DualMeshGenerator::generate()
 {
@@ -261,21 +542,240 @@ DualMeshGenerator::generate()
 
     auto dualMesh = buildReplicatedMesh(3);
 
+    std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_normals;
+    std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>> boundary_edge_normals;
+
+    for (const auto & elem : input_mesh->element_ptr_range())
+    {
+      const Point elem_centroid = elem->true_centroid();
+
+      for (const auto side : elem->side_index_range())
+      {
+        if (elem->neighbor_ptr(side) != nullptr)
+          continue;
+
+        auto side_elem = elem->build_side_ptr(side);
+        std::vector<Point> side_points;
+        side_points.reserve(side_elem->n_vertices());
+
+        for (const auto n : make_range(side_elem->n_vertices()))
+          side_points.push_back(side_elem->point(n));
+
+        Point normal = faceNormal3D(side_points);
+
+        if (normal.norm() <= 1e-12)
+          continue;
+
+        const Point face_centroid = side_elem->true_centroid();
+
+        if (normal * (elem_centroid - face_centroid) > 0.0)
+          normal = -1.0 * normal;
+
+        for (const auto n : make_range(side_elem->n_vertices()))
+          addUniqueDirection3D(boundary_node_normals[side_elem->node_id(n)], normal);
+
+        for (const auto n : make_range(side_elem->n_vertices()))
+        {
+          const dof_id_type node0 = side_elem->node_id(n);
+          const dof_id_type node1 = side_elem->node_id((n + 1) % side_elem->n_vertices());
+
+          addUniqueDirection3D(boundary_edge_normals[edgeKey(node0, node1)], normal);
+        }
+      }
+    }
+
+    std::unordered_set<dof_id_type> boundary_vertex_nodes;
+
+    for (const auto & node_normals : boundary_node_normals)
+      if (node_normals.second.size() > 1)
+        boundary_vertex_nodes.insert(node_normals.first);
+
+    std::map<std::pair<dof_id_type, dof_id_type>, Point> boundary_edge_midpoints;
+
+    for (const auto & edge_normals : boundary_edge_normals)
+    {
+      const auto & edge = edge_normals.first;
+
+      if (edge_normals.second.size() > 1 && boundary_vertex_nodes.count(edge.first) &&
+          boundary_vertex_nodes.count(edge.second))
+        boundary_edge_midpoints[edge] =
+            0.5 * (*input_mesh->node_ptr(edge.first) + *input_mesh->node_ptr(edge.second));
+    }
+
     std::unordered_map<dof_id_type, std::vector<const Elem *>> source_node_to_elems;
 
     for (const auto & elem : input_mesh->element_ptr_range())
       for (const auto n : make_range(elem->n_vertices()))
         source_node_to_elems[elem->node_id(n)].push_back(elem);
 
-    // Build one closed polyhedron around each primal node from element-edge patches and physical
-    // boundary face patches.
-    for (const auto & node_elems : source_node_to_elems)
+    _console << "DualMeshGenerator 3D external-facing primal faces:\n";
+
+    for (const auto & elem : input_mesh->element_ptr_range())
+      for (const auto side : elem->side_index_range())
+        if (elem->neighbor_ptr(side) == nullptr)
+        {
+          auto side_elem = elem->build_side_ptr(side);
+
+          _console << "  elem " << elem->id() << " side " << side << " centroid "
+                   << side_elem->true_centroid() << "\n";
+
+          for (const auto n : make_range(side_elem->n_vertices()))
+            _console << "    node " << side_elem->node_id(n) << " " << side_elem->point(n) << "\n";
+        }
+
+    _console << std::flush;
+
+    std::size_t tetrahedralized_nonconvex_polyhedron_count = 0;
+    std::size_t skipped_nonconvex_polyhedron_count = 0;
+
+    const auto addPolyhedron = [&](const std::vector<std::vector<Point>> & polyhedron_side_points)
+        -> bool
     {
-      const dof_id_type source_node_id = node_elems.first;
-      const Point & source_point = *input_mesh->node_ptr(source_node_id);
+      if (polyhedron_side_points.size() < 4)
+        return false;
+
+      const auto tryAddPolyhedron =
+          [&](MeshBase & mesh, const bool report_mid_elem_node) -> bool
+      {
+        std::vector<Node *> local_nodes;
+        std::vector<std::shared_ptr<libMesh::Polygon>> sides;
+
+        const auto getLocalNode = [&](const Point & point)
+        {
+          for (auto * const node : local_nodes)
+            if (samePoint2D(*node, point))
+              return node;
+
+          Node * const node = mesh.add_point(point);
+          local_nodes.push_back(node);
+
+          return node;
+        };
+
+        sides.reserve(polyhedron_side_points.size());
+
+        for (const auto & side_points : polyhedron_side_points)
+        {
+          auto side = std::make_shared<libMesh::C0Polygon>(side_points.size());
+
+          for (const auto i : make_range(side_points.size()))
+            side->set_node(i, getLocalNode(side_points[i]));
+
+          sides.push_back(side);
+        }
+
+        libmesh_try
+        {
+          std::unique_ptr<libMesh::Node> mid_elem_node;
+          auto dual_elem = std::make_unique<libMesh::C0Polyhedron>(sides, mid_elem_node);
+
+          if (mid_elem_node)
+          {
+            if (report_mid_elem_node)
+              _console << "DualMeshGenerator 3D mid-element node " << *mid_elem_node << "\n";
+            mesh.add_node(std::move(mid_elem_node));
+          }
+
+          mesh.add_elem(std::move(dual_elem));
+        }
+        libmesh_catch (const libMesh::NotImplemented &)
+        {
+          return false;
+        }
+        libmesh_catch (const libMesh::LogicError &)
+        {
+          return false;
+        }
+
+        return true;
+      };
+
+      auto trial_mesh = buildReplicatedMesh(3);
+
+      if (!tryAddPolyhedron(*trial_mesh, false))
+        return false;
+
+      return tryAddPolyhedron(*dualMesh, true);
+    };
+
+    const auto addTetrahedralizedPolyhedron =
+        [&](const std::vector<std::vector<Point>> & side_points) -> bool
+    {
+      std::vector<std::vector<Point>> surface_triangles;
+
+      for (const auto & side : side_points)
+        addSidePoints3D(surface_triangles, side, true);
+
+      if (surface_triangles.size() < 4)
+        return false;
+
+      std::vector<Point> unique_points;
+
+      for (const auto & triangle : surface_triangles)
+        for (const auto & point : triangle)
+          addUniquePoint(unique_points, point);
+
+      std::vector<std::array<Point, 4>> tets;
+
+      for (const auto & apex : unique_points)
+      {
+        std::vector<std::array<Point, 4>> candidate_tets;
+        bool valid_candidate = true;
+
+        for (const auto & side : side_points)
+        {
+          bool side_contains_apex = false;
+
+          for (const auto & point : side)
+            if (samePoint2D(point, apex))
+            {
+              side_contains_apex = true;
+              break;
+            }
+
+          if (side_contains_apex)
+            continue;
+
+          std::vector<std::vector<Point>> side_triangles;
+          addSidePoints3D(side_triangles, side, true);
+
+          for (const auto & triangle : side_triangles)
+          {
+            if (std::abs(tetVolume6(apex, triangle[0], triangle[1], triangle[2])) <= 1e-12)
+            {
+              valid_candidate = false;
+              break;
+            }
+
+            const Point tet_centroid = 0.25 * (apex + triangle[0] + triangle[1] + triangle[2]);
+
+            if (!pointInsideTriangulatedSurface3D(tet_centroid, surface_triangles))
+            {
+              valid_candidate = false;
+              break;
+            }
+
+            if (tetVolume6(apex, triangle[0], triangle[1], triangle[2]) > 0.0)
+              candidate_tets.push_back({apex, triangle[0], triangle[1], triangle[2]});
+            else
+              candidate_tets.push_back({apex, triangle[0], triangle[2], triangle[1]});
+          }
+
+          if (!valid_candidate)
+            break;
+        }
+
+        if (valid_candidate && !candidate_tets.empty())
+        {
+          tets = candidate_tets;
+          break;
+        }
+      }
+
+      if (tets.empty())
+        return false;
 
       std::vector<Node *> local_nodes;
-      std::vector<std::shared_ptr<libMesh::Polygon>> sides;
 
       const auto getLocalNode = [&](const Point & point)
       {
@@ -289,40 +789,90 @@ DualMeshGenerator::generate()
         return node;
       };
 
-      const auto addSide = [&](const std::vector<Point> & side_points)
+      for (const auto & tet_points : tets)
       {
-        std::vector<Point> unique_side_points;
+        auto tet = std::make_unique<Tet4>();
 
-        for (const auto & point : side_points)
-          addUniquePoint(unique_side_points, point);
+        for (const auto i : make_range(tet_points.size()))
+          tet->set_node(i, getLocalNode(tet_points[i]));
 
-        if (unique_side_points.size() < 3 || !hasNonzeroArea3D(unique_side_points))
-          return;
+        dualMesh->add_elem(std::move(tet));
+      }
 
-        auto side = std::make_shared<libMesh::C0Polygon>(unique_side_points.size());
+      return true;
+    };
 
-        for (const auto i : make_range(unique_side_points.size()))
-          side->set_node(i, getLocalNode(unique_side_points[i]));
+    const auto addTriangulatedPolyhedron = [&](const std::vector<std::vector<Point>> & side_points)
+    {
+      std::vector<std::vector<Point>> triangulated_side_points;
 
-        sides.push_back(side);
-      };
+      for (const auto & side : side_points)
+        addSidePoints3D(triangulated_side_points, side, true);
+
+      if (isConvexPolyhedron3D(triangulated_side_points) && addPolyhedron(triangulated_side_points))
+        return;
+      else if (addTetrahedralizedPolyhedron(side_points))
+      {
+        ++tetrahedralized_nonconvex_polyhedron_count;
+        return;
+      }
+      else
+        ++skipped_nonconvex_polyhedron_count;
+    };
+
+    const auto addTet = [&](const Point & point0,
+                            const Point & point1,
+                            const Point & point2,
+                            const Point & point3)
+    {
+      const Real volume = tetVolume6(point0, point1, point2, point3);
+
+      if (std::abs(volume) <= 1e-12)
+        return;
+
+      auto tet = std::make_unique<Tet4>();
+      Node * const node0 = dualMesh->add_point(point0);
+      Node * const node1 = dualMesh->add_point(point1);
+      Node * const node2 = dualMesh->add_point(point2);
+      Node * const node3 = dualMesh->add_point(point3);
+
+      tet->set_node(0, node0);
+      tet->set_node(1, node1);
+      tet->set_node(2, volume > 0.0 ? node2 : node3);
+      tet->set_node(3, volume > 0.0 ? node3 : node2);
+
+      dualMesh->add_elem(std::move(tet));
+    };
+
+    // Build one dual polyhedron around each primal node using element centroids, exterior face
+    // centroids, and primal boundary vertices.
+    for (const auto & node_elems : source_node_to_elems)
+    {
+      const dof_id_type source_node_id = node_elems.first;
+      const Point & source_point = *input_mesh->node_ptr(source_node_id);
+      std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>> edge_to_points;
+      std::vector<Point> boundary_face_centroids;
+      Point boundary_normal;
 
       for (const auto & elem : node_elems.second)
       {
         const Point elem_centroid = elem->true_centroid();
-        std::vector<Point> side_centroids(elem->n_sides());
-        std::map<std::pair<dof_id_type, dof_id_type>, std::vector<unsigned int>> edge_to_sides;
 
         for (const auto side : elem->side_index_range())
         {
           auto side_elem = elem->build_side_ptr(side);
-          side_centroids[side] = side_elem->true_centroid();
+          const Point face_centroid = side_elem->true_centroid();
 
           std::vector<dof_id_type> current_side_node_ids;
+          std::vector<Point> current_side_points;
           current_side_node_ids.reserve(side_elem->n_vertices());
+          current_side_points.reserve(side_elem->n_vertices());
 
           for (const auto n : make_range(side_elem->n_vertices()))
+          {
             current_side_node_ids.push_back(side_elem->node_id(n));
+            current_side_points.push_back(side_elem->point(n));
+          }
 
           const auto source_node_it =
               std::find(current_side_node_ids.begin(), current_side_node_ids.end(), source_node_id);
@@ -338,52 +888,98 @@ DualMeshGenerator::generate()
           const dof_id_type next_node_id =
               current_side_node_ids[(source_side_index + 1) % current_side_node_ids.size()];
 
-          edge_to_sides[edgeKey(source_node_id, previous_node_id)].push_back(side);
-          edge_to_sides[edgeKey(source_node_id, next_node_id)].push_back(side);
+          auto & previous_edge_points = edge_to_points[edgeKey(source_node_id, previous_node_id)];
+          auto & next_edge_points = edge_to_points[edgeKey(source_node_id, next_node_id)];
+
+          addUniquePoint(previous_edge_points, elem_centroid);
+          addUniquePoint(next_edge_points, elem_centroid);
 
           if (elem->neighbor_ptr(side) == nullptr)
           {
-            const Point previous_midpoint =
-                0.5 * (source_point + *input_mesh->node_ptr(previous_node_id));
-            const Point next_midpoint = 0.5 * (source_point + *input_mesh->node_ptr(next_node_id));
+            addUniquePoint(previous_edge_points, face_centroid);
+            addUniquePoint(next_edge_points, face_centroid);
+            addUniquePoint(boundary_face_centroids, face_centroid);
 
-            addSide({source_point, next_midpoint, side_centroids[side], previous_midpoint});
+            const auto previous_midpoint_it =
+                boundary_edge_midpoints.find(edgeKey(source_node_id, previous_node_id));
+            const auto next_midpoint_it =
+                boundary_edge_midpoints.find(edgeKey(source_node_id, next_node_id));
+
+            if (boundary_vertex_nodes.count(source_node_id))
+            {
+              if (previous_midpoint_it != boundary_edge_midpoints.end())
+                addTet(source_point, previous_midpoint_it->second, face_centroid, elem_centroid);
+              if (next_midpoint_it != boundary_edge_midpoints.end())
+                addTet(source_point, next_midpoint_it->second, face_centroid, elem_centroid);
+            }
+
+            Point normal = faceNormal3D(current_side_points);
+
+            if (normal.norm() > 1e-12)
+            {
+              if (normal * (elem_centroid - face_centroid) > 0.0)
+                normal = -1.0 * normal;
+
+              boundary_normal += normal / normal.norm();
+            }
           }
-        }
-
-        for (auto & edge_sides : edge_to_sides)
-        {
-          auto & side_ids = edge_sides.second;
-
-          std::sort(side_ids.begin(), side_ids.end());
-          side_ids.erase(std::unique(side_ids.begin(), side_ids.end()), side_ids.end());
-
-          if (side_ids.size() != 2)
-            mooseError("Could not determine the two element sides adjacent to a 3D primal edge.");
-
-          const auto & current_edge = edge_sides.first;
-          const dof_id_type other_node_id =
-              current_edge.first == source_node_id ? current_edge.second : current_edge.first;
-          const Point edge_midpoint = 0.5 * (source_point + *input_mesh->node_ptr(other_node_id));
-
-          addSide({edge_midpoint,
-                   side_centroids[side_ids[0]],
-                   elem_centroid,
-                   side_centroids[side_ids[1]]});
         }
       }
 
-      if (sides.size() < 4)
+      std::vector<std::vector<Point>> polyhedron_side_points;
+
+      for (const auto & edge_points : edge_to_points)
+      {
+        if (edge_points.second.size() < 3)
+          continue;
+
+        const dof_id_type other_node_id = edge_points.first.first == source_node_id
+                                              ? edge_points.first.second
+                                              : edge_points.first.first;
+        const Point edge_axis = *input_mesh->node_ptr(other_node_id) - source_point;
+        const auto sorted_edge_points = sortPointsAroundAxis3D(edge_points.second, edge_axis);
+
+        addSidePoints3D(polyhedron_side_points, sorted_edge_points);
+      }
+
+      if (boundary_face_centroids.size() >= 2)
+      {
+        const Point boundary_axis = boundary_normal.norm() > 1e-12 ? boundary_normal : source_point;
+        const auto sorted_boundary_points =
+            sortPointsAroundAxis3D(boundary_face_centroids, boundary_axis);
+
+        if (boundary_vertex_nodes.count(source_node_id))
+        {
+          if (sorted_boundary_points.size() == 2)
+            addSidePoints3D(polyhedron_side_points,
+                            {source_point, sorted_boundary_points[0], sorted_boundary_points[1]});
+          else
+            for (std::size_t i = 0; i < sorted_boundary_points.size(); ++i)
+              addSidePoints3D(polyhedron_side_points,
+                              {source_point,
+                               sorted_boundary_points[i],
+                               sorted_boundary_points[(i + 1) % sorted_boundary_points.size()]});
+        }
+        else if (sorted_boundary_points.size() >= 3)
+          addSidePoints3D(polyhedron_side_points, sorted_boundary_points);
+      }
+
+      if (polyhedron_side_points.size() < 4)
         continue;
 
-      std::unique_ptr<libMesh::Node> mid_elem_node;
-      auto dual_elem = std::make_unique<libMesh::C0Polyhedron>(sides, mid_elem_node);
+      if (isConvexPolyhedron3D(polyhedron_side_points) && addPolyhedron(polyhedron_side_points))
+      {
+        continue;
+      }
 
-      if (mid_elem_node)
-        dualMesh->add_node(std::move(mid_elem_node));
-
-      dualMesh->add_elem(std::move(dual_elem));
+      addTriangulatedPolyhedron(polyhedron_side_points);
     }
+
+    _console << "DualMeshGenerator tetrahedralized " << tetrahedralized_nonconvex_polyhedron_count
+             << " non-convex 3D dual polyhedra.\n"
+             << "DualMeshGenerator skipped " << skipped_nonconvex_polyhedron_count
+             << " non-convex 3D dual polyhedra.\n"
+             << std::flush;
 
     dualMesh->unset_is_prepared();
     return dynamic_pointer_cast<MeshBase>(dualMesh);

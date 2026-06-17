@@ -2,7 +2,7 @@
     [mySphere]
         type = SphereMeshGenerator
         nr = 1
-        radius = 3
+        radius = 1
     []
 
     [myDualGen]
