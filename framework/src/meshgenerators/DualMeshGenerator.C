@@ -11,12 +11,15 @@
 #include "Conversion.h"
 #include "CastUniquePointer.h"
 #include "MooseMeshUtils.h"
+#include "libmesh/cell_c0polyhedron.h"
+#include "libmesh/face_c0polygon.h"
 #include "libmesh/node_elem.h"
 #include "libmesh/poly2tri_triangulator.h"
 #include "libmesh/elem.h"
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 
 registerMooseObject("MooseApp", DualMeshGenerator);
 
@@ -38,7 +41,7 @@ DualMeshGenerator::validParams()
       "Angular tolerance, in radians, used to decide whether a primal boundary node is collinear "
       "with its two adjacent boundary edges. Nodes whose boundary angle differs from pi by more "
       "than this tolerance are treated as primal boundary vertices.");
-  params.addClassDescription("Takes a 2D mesh as input and returns a dual mesh, i.e.,"
+  params.addClassDescription("Takes a 2D or 3D mesh as input and returns a dual mesh, i.e.,"
                              "changes each input node into an element and each input element "
                              "into a node located at its circumcenter or centroid.");
   return params;
@@ -222,15 +225,169 @@ struct BoundarySegment
   Point p1;
 };
 
+static std::pair<dof_id_type, dof_id_type>
+edgeKey(const dof_id_type node0, const dof_id_type node1)
+{
+  return {std::min(node0, node1), std::max(node0, node1)};
+}
+
+static bool
+hasNonzeroArea3D(const std::vector<Point> & points, const Real tol = 1e-12)
+{
+  for (std::size_t i = 0; i < points.size(); ++i)
+    for (std::size_t j = i + 1; j < points.size(); ++j)
+      for (std::size_t k = j + 1; k < points.size(); ++k)
+        if (((points[j] - points[i]).cross(points[k] - points[i])).norm() > tol)
+          return true;
+
+  return false;
+}
+
 std::unique_ptr<MeshBase>
 DualMeshGenerator::generate()
 {
   const auto input_mesh = std::move(_input);
 
-  if (input_mesh->mesh_dimension() != 2)
-    mooseError("DualMeshGenerator currently only supports 2D Meshes");
-
   const bool use_voronoi = _dual_mesh_type == "voronoi";
+  const unsigned int mesh_dimension = input_mesh->mesh_dimension();
+
+  if (mesh_dimension != 2 && mesh_dimension != 3)
+    mooseError("DualMeshGenerator currently only supports 2D and 3D Meshes");
+
+  if (mesh_dimension == 3)
+  {
+    if (use_voronoi)
+      mooseError("DualMeshGenerator does not support Voronoi duals for 3D meshes");
+
+    auto dualMesh = buildReplicatedMesh(3);
+
+    std::unordered_map<dof_id_type, std::vector<const Elem *>> source_node_to_elems;
+
+    for (const auto & elem : input_mesh->element_ptr_range())
+      for (const auto n : make_range(elem->n_vertices()))
+        source_node_to_elems[elem->node_id(n)].push_back(elem);
+
+    // Build one closed polyhedron around each primal node from element-edge patches and physical
+    // boundary face patches.
+    for (const auto & node_elems : source_node_to_elems)
+    {
+      const dof_id_type source_node_id = node_elems.first;
+      const Point & source_point = *input_mesh->node_ptr(source_node_id);
+
+      std::vector<Node *> local_nodes;
+      std::vector<std::shared_ptr<libMesh::Polygon>> sides;
+
+      const auto getLocalNode = [&](const Point & point)
+      {
+        for (auto * const node : local_nodes)
+          if (samePoint2D(*node, point))
+            return node;
+
+        Node * const node = dualMesh->add_point(point);
+        local_nodes.push_back(node);
+
+        return node;
+      };
+
+      const auto addSide = [&](const std::vector<Point> & side_points)
+      {
+        std::vector<Point> unique_side_points;
+
+        for (const auto & point : side_points)
+          addUniquePoint(unique_side_points, point);
+
+        if (unique_side_points.size() < 3 || !hasNonzeroArea3D(unique_side_points))
+          return;
+
+        auto side = std::make_shared<libMesh::C0Polygon>(unique_side_points.size());
+
+        for (const auto i : make_range(unique_side_points.size()))
+          side->set_node(i, getLocalNode(unique_side_points[i]));
+
+        sides.push_back(side);
+      };
+
+      for (const auto & elem : node_elems.second)
+      {
+        const Point elem_centroid = elem->true_centroid();
+        std::vector<Point> side_centroids(elem->n_sides());
+        std::map<std::pair<dof_id_type, dof_id_type>, std::vector<unsigned int>> edge_to_sides;
+
+        for (const auto side : elem->side_index_range())
+        {
+          auto side_elem = elem->build_side_ptr(side);
+          side_centroids[side] = side_elem->true_centroid();
+
+          std::vector<dof_id_type> current_side_node_ids;
+          current_side_node_ids.reserve(side_elem->n_vertices());
+
+          for (const auto n : make_range(side_elem->n_vertices()))
+            current_side_node_ids.push_back(side_elem->node_id(n));
+
+          const auto source_node_it =
+              std::find(current_side_node_ids.begin(), current_side_node_ids.end(), source_node_id);
+
+          if (source_node_it == current_side_node_ids.end())
+            continue;
+
+          const auto source_side_index =
+              cast_int<unsigned int>(source_node_it - current_side_node_ids.begin());
+          const dof_id_type previous_node_id =
+              current_side_node_ids[(source_side_index + current_side_node_ids.size() - 1) %
+                                    current_side_node_ids.size()];
+          const dof_id_type next_node_id =
+              current_side_node_ids[(source_side_index + 1) % current_side_node_ids.size()];
+
+          edge_to_sides[edgeKey(source_node_id, previous_node_id)].push_back(side);
+          edge_to_sides[edgeKey(source_node_id, next_node_id)].push_back(side);
+
+          if (elem->neighbor_ptr(side) == nullptr)
+          {
+            const Point previous_midpoint =
+                0.5 * (source_point + *input_mesh->node_ptr(previous_node_id));
+            const Point next_midpoint = 0.5 * (source_point + *input_mesh->node_ptr(next_node_id));
+
+            addSide({source_point, next_midpoint, side_centroids[side], previous_midpoint});
+          }
+        }
+
+        for (auto & edge_sides : edge_to_sides)
+        {
+          auto & side_ids = edge_sides.second;
+
+          std::sort(side_ids.begin(), side_ids.end());
+          side_ids.erase(std::unique(side_ids.begin(), side_ids.end()), side_ids.end());
+
+          if (side_ids.size() != 2)
+            mooseError("Could not determine the two element sides adjacent to a 3D primal edge.");
+
+          const auto & current_edge = edge_sides.first;
+          const dof_id_type other_node_id =
+              current_edge.first == source_node_id ? current_edge.second : current_edge.first;
+          const Point edge_midpoint = 0.5 * (source_point + *input_mesh->node_ptr(other_node_id));
+
+          addSide({edge_midpoint,
+                   side_centroids[side_ids[0]],
+                   elem_centroid,
+                   side_centroids[side_ids[1]]});
+        }
+      }
+
+      if (sides.size() < 4)
+        continue;
+
+      std::unique_ptr<libMesh::Node> mid_elem_node;
+      auto dual_elem = std::make_unique<libMesh::C0Polyhedron>(sides, mid_elem_node);
+
+      if (mid_elem_node)
+        dualMesh->add_node(std::move(mid_elem_node));
+
+      dualMesh->add_elem(std::move(dual_elem));
+    }
+
+    dualMesh->unset_is_prepared();
+    return dynamic_pointer_cast<MeshBase>(dualMesh);
+  }
 
   std::unordered_map<dof_id_type, Point> boundary_node_points;
   std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_midpoints;
