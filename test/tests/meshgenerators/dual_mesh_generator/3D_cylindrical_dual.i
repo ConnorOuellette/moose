@@ -7,7 +7,6 @@
         has_outer_square = false
         preserve_volumes = false
         smoothing_max_it = 0
-
     []
 
     [extrude]
@@ -21,9 +20,18 @@
         input = extrude
     []
 
+    [check]
+        type = MeshDiagnosticsGenerator
+        input = myDualGen
+        examine_element_overlap = WARNING
+        examine_non_matching_edges = WARNING
+        examine_element_volumes = WARNING
+        minimum_element_volumes = 0
+    []
+
     [SdmPerElemGen]
         type = SubdomainPerElementGenerator
-        input = myDualGen
+        input = check
     []
 
     [convert]
