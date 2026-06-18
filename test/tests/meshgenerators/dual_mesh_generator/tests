@@ -1,6 +1,6 @@
 [Tests]
   design = 'meshgenerators/DualMeshGenerator.md'
-  issues = '#<some issue number>'
+  issues = '#33143'
   [3D]
     type = 'Exodiff'
     input = '3D_cartesian_dual.i'
