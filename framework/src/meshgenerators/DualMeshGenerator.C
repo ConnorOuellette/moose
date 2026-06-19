@@ -318,8 +318,7 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
           !pointIndex(side_points[side_i][(point_i + 1) % side_points[side_i].size()], p1))
         return false;
 
-      edge_to_sides[{std::min(p0, p1), std::max(p0, p1)}].push_back(
-          cast_int<unsigned int>(side_i));
+      edge_to_sides[{std::min(p0, p1), std::max(p0, p1)}].push_back(cast_int<unsigned int>(side_i));
     }
 
   bool found_concave_edge = false;
@@ -364,8 +363,7 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
 
     const Real side_angle = signedAngle(side_direction0, side_direction1);
 
-    if (std::abs(side_angle) <= 1e-10 ||
-        std::abs(std::abs(side_angle) - libMesh::pi) <= 1e-10)
+    if (std::abs(side_angle) <= 1e-10 || std::abs(std::abs(side_angle) - libMesh::pi) <= 1e-10)
       continue;
 
     const auto inSmallerWedge = [&](Point direction) -> bool
@@ -403,15 +401,13 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
     }
 
     const Point center_direction = edgeRadialDirection(polyhedron_center);
-    const bool center_outside =
-        center_direction.norm() > tol && !inSmallerWedge(center_direction);
+    const bool center_outside = center_direction.norm() > tol && !inSmallerWedge(center_direction);
 
     if (!center_outside && outside_count <= inside_count)
       continue;
 
-    const Real concave_score =
-        (center_outside ? 1000.0 : 0.0) + static_cast<Real>(outside_count) -
-        static_cast<Real>(inside_count);
+    const Real concave_score = (center_outside ? 1000.0 : 0.0) + static_cast<Real>(outside_count) -
+                               static_cast<Real>(inside_count);
 
     if (concave_score > best_concave_score)
     {
@@ -958,8 +954,7 @@ DualMeshGenerator::generate()
 
         const Real side_angle = signedAngle(side_direction0, side_direction1);
 
-        if (std::abs(side_angle) <= 1e-10 ||
-            std::abs(std::abs(side_angle) - libMesh::pi) <= 1e-10)
+        if (std::abs(side_angle) <= 1e-10 || std::abs(std::abs(side_angle) - libMesh::pi) <= 1e-10)
           continue;
 
         const auto inSmallerWedge = [&](Point direction) -> bool
@@ -1003,9 +998,9 @@ DualMeshGenerator::generate()
         if (!center_outside && outside_count <= inside_count)
           continue;
 
-        const Real concave_score =
-            (center_outside ? 1000.0 : 0.0) + static_cast<Real>(outside_count) -
-            static_cast<Real>(inside_count);
+        const Real concave_score = (center_outside ? 1000.0 : 0.0) +
+                                   static_cast<Real>(outside_count) -
+                                   static_cast<Real>(inside_count);
 
         if (concave_score > best_concave_score)
         {
@@ -1030,9 +1025,7 @@ DualMeshGenerator::generate()
                << "  " << edge_point1 << "\n";
 
       const auto distanceToConcaveEdge = [&](const Point & point) -> Real
-      {
-        return ((point - edge_point0).cross(edge_vector)).norm() / edge_vector.norm();
-      };
+      { return ((point - edge_point0).cross(edge_vector)).norm() / edge_vector.norm(); };
 
       std::vector<Point> body_points;
 
@@ -1112,8 +1105,8 @@ DualMeshGenerator::generate()
               const unsigned int point0 = pointIndex(side_points[side_i][point_i]);
               const unsigned int point1 =
                   pointIndex(side_points[side_i][(point_i + 1) % side_points[side_i].size()]);
-              const auto side_edge = std::make_pair(std::min(point0, point1),
-                                                     std::max(point0, point1));
+              const auto side_edge =
+                  std::make_pair(std::min(point0, point1), std::max(point0, point1));
 
               if (isCutEdge(side_edge))
                 continue;
@@ -1190,8 +1183,7 @@ DualMeshGenerator::generate()
               side_points, body_centroid_points, positive_side_points, negative_side_points))
         return false;
 
-      const auto childBodyCentroids =
-          [&](const std::vector<std::vector<Point>> & child_side_points)
+      const auto childBodyCentroids = [&](const std::vector<std::vector<Point>> & child_side_points)
       {
         std::vector<Point> child_points;
         std::vector<Point> child_body_centroids;
