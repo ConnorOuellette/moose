@@ -21,8 +21,6 @@ public:
 
   DualMeshGenerator(const InputParameters & parameters);
 
-  Point circumcenter(const Elem * elem);
-
   std::unique_ptr<MeshBase> generate() override;
 
 protected:
@@ -31,6 +29,9 @@ protected:
   // Angular tolerance for determining colinearity of boundary sides when detecting primal boundary
   // vertices
   Real _boundary_node_angular_tol;
+
+  // Relative tolerance for geometric comparisons, scaled by the input mesh size
+  Real _geometry_relative_tol;
 
   // Dual type; either voronoi (dual nodes at primal element circumcenters) or barycentric (dual
   // nodes at primal element centroids)

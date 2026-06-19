@@ -21,21 +21,15 @@
         input = mark_center
         block = 10
     []
-    
+
     [myDualGen]
         type = DualMeshGenerator
         input = cut_center
-    []
-
-    [SdmPerElemGen]
-        type = SubdomainPerElementGenerator
-        input = myDualGen
+        dual_mesh_type = voronoi
     []
 
     [convert]
         type = ElementsToSimplicesConverter
-        input = 'SdmPerElemGen'
+        input = myDualGen
     []
-
-
 []

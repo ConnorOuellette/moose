@@ -15,13 +15,16 @@
 #include "libmesh/cell_tet4.h"
 #include "libmesh/face_c0polygon.h"
 #include "libmesh/libmesh_exceptions.h"
+#include "libmesh/mesh_tools.h"
 #include "libmesh/node_elem.h"
 #include "libmesh/poly2tri_triangulator.h"
+#include "libmesh/type_vector.h"
 #include "libmesh/elem.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 
 registerMooseObject("MooseApp", DualMeshGenerator);
@@ -44,7 +47,13 @@ DualMeshGenerator::validParams()
       "Angular tolerance, in radians, used to decide whether a primal boundary node is collinear "
       "with its two adjacent boundary edges. Nodes whose boundary angle differs from pi by more "
       "than this tolerance are treated as primal boundary vertices.");
-  params.addClassDescription("Takes a 2D or 3D mesh as input and returns a dual mesh, i.e.,"
+  params.addRangeCheckedParam<Real>(
+      "geometry_relative_tol",
+      1e-12,
+      "geometry_relative_tol>=0",
+      "Relative tolerance used for geometric point comparison, intersection, and area checks. The "
+      "generator scales this value by the input mesh bounding-box size.");
+  params.addClassDescription("Takes a 2D or 3D mesh as input and returns a dual mesh, i.e., "
                              "changes each input node into an element and each input element "
                              "into a node located at its circumcenter or centroid.");
   return params;
@@ -54,49 +63,9 @@ DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
   : MeshGenerator(parameters),
     _input(getMesh("input")),
     _boundary_node_angular_tol(getParam<Real>("boundary_node_angular_tol")),
+    _geometry_relative_tol(getParam<Real>("geometry_relative_tol")),
     _dual_mesh_type(getParam<MooseEnum>("dual_mesh_type"))
 {
-}
-
-// Circumcenter method
-Point
-DualMeshGenerator::circumcenter(const Elem * elem)
-{
-  const unsigned int n = elem->n_vertices();
-  libmesh_assert_greater(n, 2);
-
-  const Point & p0 = elem->point(0);
-
-  Real A11 = 0.;
-  Real A12 = 0.;
-  Real A22 = 0.;
-
-  Real b1 = 0.;
-  Real b2 = 0.;
-
-  for (unsigned int i = 1; i < n; ++i)
-  {
-    const Point & pi = elem->point(i);
-
-    const Real dx = pi(0) - p0(0);
-    const Real dy = pi(1) - p0(1);
-
-    const Real rhs = 0.5 * (pi(0) * pi(0) + pi(1) * pi(1) - p0(0) * p0(0) - p0(1) * p0(1));
-
-    A11 += dx * dx;
-    A12 += dx * dy;
-    A22 += dy * dy;
-
-    b1 += dx * rhs;
-    b2 += dy * rhs;
-  }
-
-  const Real det = A11 * A22 - A12 * A12;
-
-  const Real cx = (A22 * b1 - A12 * b2) / det;
-  const Real cy = (A11 * b2 - A12 * b1) / det;
-
-  return Point(cx, cy, 0.0);
 }
 
 // True only when two elements share a full edge.
@@ -120,29 +89,35 @@ cross2D(const Point & a, const Point & b, const Point & c)
 }
 
 static bool
-samePoint2D(const Point & a, const Point & b, const Real tol = 1e-12)
+samePoint(const Point & a, const Point & b, const Real length_tol = 1e-12)
 {
-  return (a - b).norm() <= tol;
+  return (a - b).norm() <= length_tol;
 }
 
 static void
-addUniquePoint(std::vector<Point> & points, const Point & point, const Real tol = 1e-12)
+addUniquePoint(std::vector<Point> & points, const Point & point, const Real length_tol = 1e-12)
 {
   for (const auto & existing_point : points)
-    if (samePoint2D(existing_point, point, tol))
+    if (samePoint(existing_point, point, length_tol))
       return;
 
   points.push_back(point);
 }
 
 static bool
-pointOnSegment2D(const Point & point, const Point & a, const Point & b, const Real tol = 1e-12)
+pointOnSegment2D(const Point & point,
+                 const Point & a,
+                 const Point & b,
+                 const Real length_tol,
+                 const Real area_tol)
 {
-  if (std::abs(cross2D(a, b, point)) > tol)
+  if (std::abs(cross2D(a, b, point)) > area_tol)
     return false;
 
-  return (point(0) >= std::min(a(0), b(0)) - tol && point(0) <= std::max(a(0), b(0)) + tol &&
-          point(1) >= std::min(a(1), b(1)) - tol && point(1) <= std::max(a(1), b(1)) + tol);
+  return (point(0) >= std::min(a(0), b(0)) - length_tol &&
+          point(0) <= std::max(a(0), b(0)) + length_tol &&
+          point(1) >= std::min(a(1), b(1)) - length_tol &&
+          point(1) <= std::max(a(1), b(1)) + length_tol);
 }
 
 static void
@@ -151,25 +126,27 @@ addSegmentIntersections2D(std::vector<Point> & points,
                           const Point & p1,
                           const Point & q0,
                           const Point & q1,
-                          const Real tol = 1e-12)
+                          const Real length_tol,
+                          const Real area_tol,
+                          const Real parameter_tol)
 {
   const Point r = p1 - p0;
   const Point s = q1 - q0;
   const Real denom = r(0) * s(1) - r(1) * s(0);
 
-  if (std::abs(denom) < tol)
+  if (std::abs(denom) < area_tol)
   {
-    if (std::abs(cross2D(p0, p1, q0)) > tol)
+    if (std::abs(cross2D(p0, p1, q0)) > area_tol)
       return;
 
-    if (pointOnSegment2D(q0, p0, p1, tol))
-      addUniquePoint(points, q0, tol);
-    if (pointOnSegment2D(q1, p0, p1, tol))
-      addUniquePoint(points, q1, tol);
-    if (pointOnSegment2D(p0, q0, q1, tol))
-      addUniquePoint(points, p0, tol);
-    if (pointOnSegment2D(p1, q0, q1, tol))
-      addUniquePoint(points, p1, tol);
+    if (pointOnSegment2D(q0, p0, p1, length_tol, area_tol))
+      addUniquePoint(points, q0, length_tol);
+    if (pointOnSegment2D(q1, p0, p1, length_tol, area_tol))
+      addUniquePoint(points, q1, length_tol);
+    if (pointOnSegment2D(p0, q0, q1, length_tol, area_tol))
+      addUniquePoint(points, p0, length_tol);
+    if (pointOnSegment2D(p1, q0, q1, length_tol, area_tol))
+      addUniquePoint(points, p1, length_tol);
 
     return;
   }
@@ -178,12 +155,16 @@ addSegmentIntersections2D(std::vector<Point> & points,
   const Real t = (qp(0) * s(1) - qp(1) * s(0)) / denom;
   const Real u = (qp(0) * r(1) - qp(1) * r(0)) / denom;
 
-  if (t >= -tol && t <= 1.0 + tol && u >= -tol && u <= 1.0 + tol)
-    addUniquePoint(points, p0 + t * r, tol);
+  if (t >= -parameter_tol && t <= 1.0 + parameter_tol && u >= -parameter_tol &&
+      u <= 1.0 + parameter_tol)
+    addUniquePoint(points, p0 + t * r, length_tol);
 }
 
 static bool
-pointInPolygon2D(const Point & point, const std::vector<Point> & polygon, const Real tol = 1e-12)
+pointInPolygon2D(const Point & point,
+                 const std::vector<Point> & polygon,
+                 const Real length_tol,
+                 const Real area_tol)
 {
   if (polygon.size() < 3)
     return false;
@@ -195,7 +176,7 @@ pointInPolygon2D(const Point & point, const std::vector<Point> & polygon, const 
     const Point & pi = polygon[i];
     const Point & pj = polygon[j];
 
-    if (pointOnSegment2D(point, pj, pi, tol))
+    if (pointOnSegment2D(point, pj, pi, length_tol, area_tol))
       return true;
 
     if ((pi(1) > point(1)) != (pj(1) > point(1)) &&
@@ -534,12 +515,10 @@ DualMeshGenerator::generate()
 
   if (mesh_dimension != 2 && mesh_dimension != 3)
     mooseError("DualMeshGenerator currently only supports 2D and 3D Meshes");
-
+  if (mesh_dimension == 3 && use_voronoi)
+    mooseError("DualMeshGenerator does not support Voronoi duals for 3D meshes");
   if (mesh_dimension == 3)
   {
-    if (use_voronoi)
-      mooseError("DualMeshGenerator does not support Voronoi duals for 3D meshes");
-
     auto dualMesh = buildReplicatedMesh(3);
 
     std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_normals;
@@ -608,34 +587,16 @@ DualMeshGenerator::generate()
       for (const auto n : make_range(elem->n_vertices()))
         source_node_to_elems[elem->node_id(n)].push_back(elem);
 
-    _console << "DualMeshGenerator 3D external-facing primal faces:\n";
-
-    for (const auto & elem : input_mesh->element_ptr_range())
-      for (const auto side : elem->side_index_range())
-        if (elem->neighbor_ptr(side) == nullptr)
-        {
-          auto side_elem = elem->build_side_ptr(side);
-
-          _console << "  elem " << elem->id() << " side " << side << " centroid "
-                   << side_elem->true_centroid() << "\n";
-
-          for (const auto n : make_range(side_elem->n_vertices()))
-            _console << "    node " << side_elem->node_id(n) << " " << side_elem->point(n) << "\n";
-        }
-
-    _console << std::flush;
-
     std::size_t tetrahedralized_nonconvex_polyhedron_count = 0;
     std::size_t skipped_nonconvex_polyhedron_count = 0;
 
-    const auto addPolyhedron = [&](const std::vector<std::vector<Point>> & polyhedron_side_points)
-        -> bool
+    const auto addPolyhedron =
+        [&](const std::vector<std::vector<Point>> & polyhedron_side_points) -> bool
     {
       if (polyhedron_side_points.size() < 4)
         return false;
 
-      const auto tryAddPolyhedron =
-          [&](MeshBase & mesh, const bool report_mid_elem_node) -> bool
+      const auto tryAddPolyhedron = [&](MeshBase & mesh) -> bool
       {
         std::vector<Node *> local_nodes;
         std::vector<std::shared_ptr<libMesh::Polygon>> sides;
@@ -643,7 +604,7 @@ DualMeshGenerator::generate()
         const auto getLocalNode = [&](const Point & point)
         {
           for (auto * const node : local_nodes)
-            if (samePoint2D(*node, point))
+            if (samePoint(*node, point))
               return node;
 
           Node * const node = mesh.add_point(point);
@@ -670,32 +631,22 @@ DualMeshGenerator::generate()
           auto dual_elem = std::make_unique<libMesh::C0Polyhedron>(sides, mid_elem_node);
 
           if (mid_elem_node)
-          {
-            if (report_mid_elem_node)
-              _console << "DualMeshGenerator 3D mid-element node " << *mid_elem_node << "\n";
             mesh.add_node(std::move(mid_elem_node));
-          }
 
           mesh.add_elem(std::move(dual_elem));
         }
-        libmesh_catch (const libMesh::NotImplemented &)
-        {
-          return false;
-        }
-        libmesh_catch (const libMesh::LogicError &)
-        {
-          return false;
-        }
+        libmesh_catch(const libMesh::NotImplemented &) { return false; }
+        libmesh_catch(const libMesh::LogicError &) { return false; }
 
         return true;
       };
 
       auto trial_mesh = buildReplicatedMesh(3);
 
-      if (!tryAddPolyhedron(*trial_mesh, false))
+      if (!tryAddPolyhedron(*trial_mesh))
         return false;
 
-      return tryAddPolyhedron(*dualMesh, true);
+      return tryAddPolyhedron(*dualMesh);
     };
 
     const auto addTetrahedralizedPolyhedron =
@@ -727,7 +678,7 @@ DualMeshGenerator::generate()
           bool side_contains_apex = false;
 
           for (const auto & point : side)
-            if (samePoint2D(point, apex))
+            if (samePoint(point, apex))
             {
               side_contains_apex = true;
               break;
@@ -780,7 +731,7 @@ DualMeshGenerator::generate()
       const auto getLocalNode = [&](const Point & point)
       {
         for (auto * const node : local_nodes)
-          if (samePoint2D(*node, point))
+          if (samePoint(*node, point))
             return node;
 
         Node * const node = dualMesh->add_point(point);
@@ -820,30 +771,6 @@ DualMeshGenerator::generate()
         ++skipped_nonconvex_polyhedron_count;
     };
 
-    const auto addTet = [&](const Point & point0,
-                            const Point & point1,
-                            const Point & point2,
-                            const Point & point3)
-    {
-      const Real volume = tetVolume6(point0, point1, point2, point3);
-
-      if (std::abs(volume) <= 1e-12)
-        return;
-
-      auto tet = std::make_unique<Tet4>();
-      Node * const node0 = dualMesh->add_point(point0);
-      Node * const node1 = dualMesh->add_point(point1);
-      Node * const node2 = dualMesh->add_point(point2);
-      Node * const node3 = dualMesh->add_point(point3);
-
-      tet->set_node(0, node0);
-      tet->set_node(1, node1);
-      tet->set_node(2, volume > 0.0 ? node2 : node3);
-      tet->set_node(3, volume > 0.0 ? node3 : node2);
-
-      dualMesh->add_elem(std::move(tet));
-    };
-
     // Build one dual polyhedron around each primal node using element centroids, exterior face
     // centroids, and primal boundary vertices.
     for (const auto & node_elems : source_node_to_elems)
@@ -851,6 +778,8 @@ DualMeshGenerator::generate()
       const dof_id_type source_node_id = node_elems.first;
       const Point & source_point = *input_mesh->node_ptr(source_node_id);
       std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>> edge_to_points;
+      std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>>
+          midpoint_boundary_face_centroids;
       std::vector<Point> boundary_face_centroids;
       Point boundary_normal;
 
@@ -908,9 +837,18 @@ DualMeshGenerator::generate()
             if (boundary_vertex_nodes.count(source_node_id))
             {
               if (previous_midpoint_it != boundary_edge_midpoints.end())
-                addTet(source_point, previous_midpoint_it->second, face_centroid, elem_centroid);
+              {
+                addUniquePoint(previous_edge_points, previous_midpoint_it->second);
+                addUniquePoint(midpoint_boundary_face_centroids[previous_midpoint_it->first],
+                               face_centroid);
+              }
+
               if (next_midpoint_it != boundary_edge_midpoints.end())
-                addTet(source_point, next_midpoint_it->second, face_centroid, elem_centroid);
+              {
+                addUniquePoint(next_edge_points, next_midpoint_it->second);
+                addUniquePoint(midpoint_boundary_face_centroids[next_midpoint_it->first],
+                               face_centroid);
+              }
             }
 
             Point normal = faceNormal3D(current_side_points);
@@ -927,6 +865,7 @@ DualMeshGenerator::generate()
       }
 
       std::vector<std::vector<Point>> polyhedron_side_points;
+      std::vector<std::pair<Point, Point>> midpoint_split_boundary_faces;
 
       for (const auto & edge_points : edge_to_points)
       {
@@ -942,23 +881,59 @@ DualMeshGenerator::generate()
         addSidePoints3D(polyhedron_side_points, sorted_edge_points);
       }
 
+      for (const auto & midpoint_face_centroids : midpoint_boundary_face_centroids)
+      {
+        const auto midpoint_it = boundary_edge_midpoints.find(midpoint_face_centroids.first);
+
+        if (midpoint_it == boundary_edge_midpoints.end())
+          continue;
+
+        for (const auto & face_centroid : midpoint_face_centroids.second)
+          addSidePoints3D(polyhedron_side_points,
+                          {source_point, midpoint_it->second, face_centroid});
+
+        for (std::size_t i = 0; i < midpoint_face_centroids.second.size(); ++i)
+          for (std::size_t j = i + 1; j < midpoint_face_centroids.second.size(); ++j)
+            midpoint_split_boundary_faces.push_back(
+                {midpoint_face_centroids.second[i], midpoint_face_centroids.second[j]});
+      }
+
       if (boundary_face_centroids.size() >= 2)
       {
         const Point boundary_axis = boundary_normal.norm() > 1e-12 ? boundary_normal : source_point;
         const auto sorted_boundary_points =
             sortPointsAroundAxis3D(boundary_face_centroids, boundary_axis);
 
+        const auto boundaryFaceWasSplit = [&](const Point & point0, const Point & point1)
+        {
+          for (const auto & split_boundary_face : midpoint_split_boundary_faces)
+            if ((samePoint(point0, split_boundary_face.first) &&
+                 samePoint(point1, split_boundary_face.second)) ||
+                (samePoint(point0, split_boundary_face.second) &&
+                 samePoint(point1, split_boundary_face.first)))
+              return true;
+
+          return false;
+        };
+
         if (boundary_vertex_nodes.count(source_node_id))
         {
           if (sorted_boundary_points.size() == 2)
-            addSidePoints3D(polyhedron_side_points,
-                            {source_point, sorted_boundary_points[0], sorted_boundary_points[1]});
+          {
+            if (!boundaryFaceWasSplit(sorted_boundary_points[0], sorted_boundary_points[1]))
+              addSidePoints3D(polyhedron_side_points,
+                              {source_point, sorted_boundary_points[0], sorted_boundary_points[1]});
+          }
           else
             for (std::size_t i = 0; i < sorted_boundary_points.size(); ++i)
-              addSidePoints3D(polyhedron_side_points,
-                              {source_point,
-                               sorted_boundary_points[i],
-                               sorted_boundary_points[(i + 1) % sorted_boundary_points.size()]});
+            {
+              const Point & point0 = sorted_boundary_points[i];
+              const Point & point1 =
+                  sorted_boundary_points[(i + 1) % sorted_boundary_points.size()];
+
+              if (!boundaryFaceWasSplit(point0, point1))
+                addSidePoints3D(polyhedron_side_points, {source_point, point0, point1});
+            }
         }
         else if (sorted_boundary_points.size() >= 3)
           addSidePoints3D(polyhedron_side_points, sorted_boundary_points);
@@ -978,12 +953,35 @@ DualMeshGenerator::generate()
     _console << "DualMeshGenerator tetrahedralized " << tetrahedralized_nonconvex_polyhedron_count
              << " non-convex 3D dual polyhedra.\n"
              << "DualMeshGenerator skipped " << skipped_nonconvex_polyhedron_count
-             << " non-convex 3D dual polyhedra.\n"
-             << std::flush;
+             << " non-convex 3D dual polyhedra.\n";
+
+    std::map<std::string, std::size_t> elem_type_counts;
+
+    for (const auto & elem : dualMesh->element_ptr_range())
+      ++elem_type_counts[Moose::stringify(elem->type())];
+
+    _console << "DualMeshGenerator output element types:";
+
+    if (elem_type_counts.empty())
+      _console << " none";
+    else
+      for (const auto & elem_type_count : elem_type_counts)
+        _console << " " << elem_type_count.first << "=" << elem_type_count.second;
+
+    _console << "\n" << std::flush;
 
     dualMesh->unset_is_prepared();
     return dynamic_pointer_cast<MeshBase>(dualMesh);
   }
+
+  // BEGIN 2D
+  const auto input_bounding_box = MeshTools::create_bounding_box(*input_mesh);
+  const Point mesh_extent = input_bounding_box.max() - input_bounding_box.min();
+  const Real mesh_scale = std::max(std::max(std::abs(mesh_extent(0)), std::abs(mesh_extent(1))),
+                                   std::numeric_limits<Real>::min());
+  const Real length_tol = _geometry_relative_tol * mesh_scale;
+  const Real area_tol = _geometry_relative_tol * mesh_scale * mesh_scale;
+  const Real parameter_tol = _geometry_relative_tol;
 
   std::unordered_map<dof_id_type, Point> boundary_node_points;
   std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_midpoints;
@@ -1051,7 +1049,7 @@ DualMeshGenerator::generate()
 
     const Real norm_product = v0.norm() * v1.norm();
 
-    if (norm_product < 1e-14)
+    if (norm_product < length_tol * length_tol)
     {
       boundary_vertex_nodes.insert(node_id);
       continue;
@@ -1141,10 +1139,18 @@ DualMeshGenerator::generate()
       tri_mesh->add_elem(std::move(node_elem));
     }
 
-    Node * p0 = tri_mesh->add_point(Point(-100.0, -100.0, 0.0));
-    Node * p1 = tri_mesh->add_point(Point(100.0, -100.0, 0.0));
-    Node * p2 = tri_mesh->add_point(Point(100.0, 100.0, 0.0));
-    Node * p3 = tri_mesh->add_point(Point(-100.0, 100.0, 0.0));
+    const Real outer_padding = 10.0 * mesh_scale;
+    const Point outer_min(input_bounding_box.min()(0) - outer_padding,
+                          input_bounding_box.min()(1) - outer_padding,
+                          0.0);
+    const Point outer_max(input_bounding_box.max()(0) + outer_padding,
+                          input_bounding_box.max()(1) + outer_padding,
+                          0.0);
+
+    Node * p0 = tri_mesh->add_point(Point(outer_min(0), outer_min(1), 0.0));
+    Node * p1 = tri_mesh->add_point(Point(outer_max(0), outer_min(1), 0.0));
+    Node * p2 = tri_mesh->add_point(Point(outer_max(0), outer_max(1), 0.0));
+    Node * p3 = tri_mesh->add_point(Point(outer_min(0), outer_max(1), 0.0));
 
     auto big_square = std::make_unique<Quad4>();
 
@@ -1172,7 +1178,8 @@ DualMeshGenerator::generate()
 
       const dof_id_type center_id = dual_centers.size();
 
-      dual_centers.push_back(circumcenter(tri_elem));
+      dual_centers.push_back(
+          libMesh::circumcenter(tri_elem->point(0), tri_elem->point(1), tri_elem->point(2)));
       source_elem_to_center_id[tri_elem->id()] = center_id;
 
       for (const auto n : make_range(tri_elem->n_nodes()))
@@ -1201,7 +1208,7 @@ DualMeshGenerator::generate()
 
     for (const auto & segment : physical_boundary_segments)
     {
-      if (pointOnSegment2D(point, segment.p0, segment.p1))
+      if (pointOnSegment2D(point, segment.p0, segment.p1, length_tol, area_tol))
         return true;
 
       if ((segment.p0(1) > point(1)) != (segment.p1(1) > point(1)))
@@ -1227,7 +1234,7 @@ DualMeshGenerator::generate()
 
     for (const auto & point : dual_points)
       if (pointInsideBoundary(point))
-        addUniquePoint(clipped_points, point);
+        addUniquePoint(clipped_points, point, length_tol);
 
     for (unsigned int i = 0; i < dual_points.size(); ++i)
     {
@@ -1235,17 +1242,23 @@ DualMeshGenerator::generate()
       const Point & p1 = dual_points[(i + 1) % dual_points.size()];
 
       for (const auto & boundary_segment : boundary_clip_segments)
-        addSegmentIntersections2D(
-            clipped_points, p0, p1, boundary_segment.first, boundary_segment.second);
+        addSegmentIntersections2D(clipped_points,
+                                  p0,
+                                  p1,
+                                  boundary_segment.first,
+                                  boundary_segment.second,
+                                  length_tol,
+                                  area_tol,
+                                  parameter_tol);
     }
 
     for (const auto & boundary_segment : boundary_clip_segments)
     {
-      if (pointInPolygon2D(boundary_segment.first, dual_points))
-        addUniquePoint(clipped_points, boundary_segment.first);
+      if (pointInPolygon2D(boundary_segment.first, dual_points, length_tol, area_tol))
+        addUniquePoint(clipped_points, boundary_segment.first, length_tol);
 
-      if (pointInPolygon2D(boundary_segment.second, dual_points))
-        addUniquePoint(clipped_points, boundary_segment.second);
+      if (pointInPolygon2D(boundary_segment.second, dual_points, length_tol, area_tol))
+        addUniquePoint(clipped_points, boundary_segment.second, length_tol);
     }
 
     if (clipped_points.size() < 3)
@@ -1269,10 +1282,10 @@ DualMeshGenerator::generate()
     std::vector<Point> unique_clipped_points;
 
     for (const auto & point : clipped_points)
-      addUniquePoint(unique_clipped_points, point);
+      addUniquePoint(unique_clipped_points, point, length_tol);
 
     if (unique_clipped_points.size() > 1 &&
-        samePoint2D(unique_clipped_points.front(), unique_clipped_points.back()))
+        samePoint(unique_clipped_points.front(), unique_clipped_points.back(), length_tol))
       unique_clipped_points.pop_back();
 
     return unique_clipped_points;
@@ -1284,7 +1297,7 @@ DualMeshGenerator::generate()
     {
       const auto point_it = boundary_node_points.find(boundary_vertex_node);
 
-      if (point_it != boundary_node_points.end() && samePoint2D(point, point_it->second))
+      if (point_it != boundary_node_points.end() && samePoint(point, point_it->second, length_tol))
         return true;
     }
 
@@ -1294,7 +1307,8 @@ DualMeshGenerator::generate()
   const auto isBoundarySegmentPoint = [&](const Point & point)
   {
     for (const auto & boundary_segment : boundary_clip_segments)
-      if (pointOnSegment2D(point, boundary_segment.first, boundary_segment.second))
+      if (pointOnSegment2D(
+              point, boundary_segment.first, boundary_segment.second, length_tol, area_tol))
         return true;
 
     return false;
@@ -1307,7 +1321,7 @@ DualMeshGenerator::generate()
 
     const Real signed_area = polygonSignedArea2D(points);
 
-    if (std::abs(signed_area) < 1e-14)
+    if (std::abs(signed_area) < area_tol)
       return points.size();
 
     const Real orientation = signed_area > 0.0 ? 1.0 : -1.0;
@@ -1318,7 +1332,8 @@ DualMeshGenerator::generate()
       const Point & current = points[i];
       const Point & next = points[(i + 1) % points.size()];
 
-      if (isBoundaryVertexPoint(current) && orientation * cross2D(previous, current, next) < -1e-12)
+      if (isBoundaryVertexPoint(current) &&
+          orientation * cross2D(previous, current, next) < -area_tol)
         return i;
     }
 
@@ -1417,7 +1432,7 @@ DualMeshGenerator::generate()
 
     for (const auto center_id : ordered_center_ids)
     {
-      addUniquePoint(dual_points, dual_centers[center_id]);
+      addUniquePoint(dual_points, dual_centers[center_id], length_tol);
       source_center_points.push_back(dual_centers[center_id]);
     }
 
@@ -1431,10 +1446,10 @@ DualMeshGenerator::generate()
 
         if (boundary_vertex_nodes.count(source_node_id) &&
             boundary_point_it != boundary_node_points.end())
-          addUniquePoint(dual_points, boundary_point_it->second);
+          addUniquePoint(dual_points, boundary_point_it->second, length_tol);
 
         for (const auto & midpoint : boundary_midpoint_it->second)
-          addUniquePoint(dual_points, midpoint);
+          addUniquePoint(dual_points, midpoint, length_tol);
 
         if (boundary_point_it != boundary_node_points.end() && !source_center_points.empty())
         {
@@ -1464,10 +1479,7 @@ DualMeshGenerator::generate()
     if (dual_points.size() < 3)
       continue;
 
-    const bool split_concave_boundary_polygon = !use_voronoi;
-    const std::size_t concave_vertex_index = split_concave_boundary_polygon
-                                                 ? concaveBoundaryVertexIndex(dual_points)
-                                                 : dual_points.size();
+    const std::size_t concave_vertex_index = concaveBoundaryVertexIndex(dual_points);
 
     if (concave_vertex_index < dual_points.size())
     {
@@ -1520,15 +1532,13 @@ DualMeshGenerator::generate()
         }
       }
 
-      if (fan_points.size() == 1)
-        mooseError("Could not find a boundary point to start concave fan triangulation.");
-
       for (std::size_t i = 1; i + 1 < fan_points.size(); ++i)
       {
         const std::vector<Point> triangle_points = {
             fan_points[0], fan_points[i], fan_points[i + 1]};
 
-        if (std::abs(cross2D(triangle_points[0], triangle_points[1], triangle_points[2])) > 1e-12)
+        if (std::abs(cross2D(triangle_points[0], triangle_points[1], triangle_points[2])) >
+            area_tol)
           addDualElement(triangle_points);
       }
 

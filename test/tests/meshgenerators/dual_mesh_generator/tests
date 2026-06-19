@@ -1,75 +1,46 @@
 [Tests]
   design = 'meshgenerators/DualMeshGenerator.md'
   issues = '#33143'
-  [3D]
+  [dual_mesh_generator_2d]
     type = 'Exodiff'
-    input = '3D_cartesian_dual.i'
+    input = 'dual_mesh_generator_2d.i'
     cli_args = '--mesh-only'
-    exodiff = '3D_cartesian_dual_in.e'
+    exodiff = 'dual_mesh_generator_2d_in.e'
     mesh_mode = 'REPLICATED'
     recover = false
 
-    requirement = 'The system shall have the capability to generate duals of a 3-dimensional mesh. (NOT IMPLEMENTED)'
+    requirement = 'The system shall have the capability to generate a dual mesh from a 2D primal mesh while maintaining primal boundary geometry.'
   []
-  [C]
+  [dual_mesh_generator_3d]
     type = 'Exodiff'
-    input = 'C.i'
+    input = 'dual_mesh_generator_3d.i'
     cli_args = '--mesh-only'
-    exodiff = 'C_in.e'
+    exodiff = 'dual_mesh_generator_3d_in.e'
     mesh_mode = 'REPLICATED'
     recover = false
 
-    requirement = 'The system shall have the capability to generate a dual mesh from an input with square concave boundaries.'
+    requirement = 'The system shall have the capability to generate a barycentric dual mesh from a 3D primal mesh while maintaining primal boundary geometry.'
   []
-  [cartesian_dual]
-    type = 'Exodiff'
-    input = 'cartesian_dual.i'
+[]
+[error_paths]
+  requirement = 'The system shall report an error when DualMeshGenerator receives'
+  [unsupported_dimension]
+    type = 'RunException'
+    input = 'dual_mesh_generator_unsupported_dimension.i'
     cli_args = '--mesh-only'
-    exodiff = 'cartesian_dual_in.e'
     mesh_mode = 'REPLICATED'
     recover = false
-
-    requirement = 'The system shall have the capability to generate a dual mesh from a standard cartesian input.'
+    expect_err = 'DualMeshGenerator currently only supports 2D and 3D Meshes'
+    detail = 'an unsupported mesh dimension.'
   []
-  [concave_dual]
-    type = 'Exodiff'
-    input = 'concave_dual.i'
+  [voronoi_3d]
+    type = 'RunException'
+    input = 'dual_mesh_generator_unsupported_type_dim.i'
     cli_args = '--mesh-only'
-    exodiff = 'concave_dual_in.e'
     mesh_mode = 'REPLICATED'
     recover = false
-
-    requirement = 'The system shall have the capability to generate a dual mesh from an input mesh with a concave boundary.'
-  []
-  [concave_primal]
-    type = 'Exodiff'
-    input = 'concave_primal.i'
-    cli_args = '--mesh-only'
-    exodiff = 'concave_primal_in.e'
-    mesh_mode = 'REPLICATED'
-    recover = false
-
-    requirement = 'Primal concave mesh for comparison to concave_dual.'
-  []
-  [concentric_dual]
-    type = 'Exodiff'
-    input = 'concentric_dual.i'
-    cli_args = '--mesh-only'
-    exodiff = 'concentric_dual_in.e'
-    mesh_mode = 'REPLICATED'
-    recover = false
-
-    requirement = 'The system shall have the capaility to generate a dual mesh from convex primal input meshes.'
-  []
-  [concentric_primal]
-    type = 'Exodiff'
-    input = 'concentric_primal.i'
-    cli_args = '--mesh-only'
-    exodiff = 'concentric_primal_in.e'
-    mesh_mode = 'REPLICATED'
-    recover = false
-
-    requirement = 'Primal concentric mesh for comparison to concentric_dual.'
+    expect_err = 'DualMeshGenerator does not support Voronoi duals for 3D meshes'
+    detail = 'an unsupported combination of dimension and mesh type'
   []
 
-  []
+[]

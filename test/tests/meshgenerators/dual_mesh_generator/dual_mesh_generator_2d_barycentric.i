@@ -22,13 +22,14 @@
         block = 10
     []
 
-    [SdmPerElemGen]
-        type = SubdomainPerElementGenerator
+    [myDualGen]
+        type = DualMeshGenerator
         input = cut_center
+        dual_mesh_type = barycentric
     []
 
     [convert]
         type = ElementsToSimplicesConverter
-        input = 'SdmPerElemGen'
+        input = myDualGen
     []
 []

@@ -8,15 +8,11 @@
     [myDualGen]
         type = DualMeshGenerator
         input = mySphere
-    []
-
-    [SdmPerElemGen]
-        type = SubdomainPerElementGenerator
-        input = myDualGen
+        dual_mesh_type = voronoi
     []
 
     [convert]
         type = ElementsToSimplicesConverter
-        input = 'SdmPerElemGen'
+        input = myDualGen
     []
 []
