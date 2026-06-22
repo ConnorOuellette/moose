@@ -265,6 +265,17 @@ tetVolume6(const Point & a, const Point & b, const Point & c, const Point & d)
   return (b - a).cross(c - a) * (d - a);
 }
 
+static Real
+meshVolume(const MeshBase & mesh)
+{
+  Real volume = 0.0;
+
+  for (const auto & elem : mesh.active_element_ptr_range())
+    volume += elem->volume();
+
+  return volume;
+}
+
 static bool
 findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
                   const std::vector<Point> & unique_points,
@@ -592,6 +603,8 @@ DualMeshGenerator::generate()
     mooseError("DualMeshGenerator does not support Voronoi duals for 3D meshes");
   if (mesh_dimension == 3)
   {
+    _console << "DualMeshGenerator 3D input mesh volume: " << meshVolume(*input_mesh) << "\n";
+
     auto dualMesh = buildReplicatedMesh(3);
 
     std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_normals;
@@ -663,6 +676,11 @@ DualMeshGenerator::generate()
     std::size_t split_nonconvex_polyhedron_count = 0;
     std::size_t tetrahedralized_nonconvex_polyhedron_count = 0;
     std::size_t skipped_nonconvex_polyhedron_count = 0;
+    std::size_t tetrahedralized_added_tet_count = 0;
+    std::size_t tetrahedralized_flat_triangle_count = 0;
+    std::size_t tetrahedralized_concave_half_plane_triangle_count = 0;
+    Real tetrahedralized_candidate_volume = 0.0;
+    Real tetrahedralized_accepted_volume = 0.0;
 
     const auto tryAddPolyhedron =
         [&](MeshBase & mesh, const std::vector<std::vector<Point>> & polyhedron_side_points) -> bool
@@ -764,59 +782,183 @@ DualMeshGenerator::generate()
 
       interior_point /= point_source.size();
 
-      bool guard_concave_plane = false;
+      bool guard_concave_half_plane = false;
       Point concave_plane_normal;
+      Point concave_half_plane_direction;
+      Point concave_edge_midpoint;
+      Real concave_half_plane_distance = 0.0;
       std::pair<unsigned int, unsigned int> concave_edge;
 
       if (findConcaveEdge3D(side_points, unique_points, concave_edge))
       {
         const Point edge_point0 = unique_points[concave_edge.first];
         const Point edge_point1 = unique_points[concave_edge.second];
-        concave_plane_normal = (edge_point1 - edge_point0).cross(interior_point - edge_point0);
+        const Point concave_edge_vector = edge_point1 - edge_point0;
+        const Point concave_edge_axis = concave_edge_vector / concave_edge_vector.norm();
+        concave_edge_midpoint = 0.5 * (edge_point0 + edge_point1);
+        concave_half_plane_direction = interior_point - concave_edge_midpoint;
+        concave_half_plane_direction -=
+            (concave_half_plane_direction * concave_edge_axis) * concave_edge_axis;
+        concave_half_plane_distance = concave_half_plane_direction.norm();
+        concave_plane_normal = concave_edge_vector.cross(interior_point - edge_point0);
 
-        if (concave_plane_normal.norm() > 1e-12)
+        if (concave_plane_normal.norm() > 1e-12 && concave_half_plane_distance > 1e-12)
         {
           concave_plane_normal /= concave_plane_normal.norm();
-          guard_concave_plane = true;
+          concave_half_plane_direction /= concave_half_plane_distance;
+          guard_concave_half_plane = true;
         }
       }
 
       std::vector<std::array<Point, 4>> tets;
+      std::size_t flat_triangle_count = 0;
+      std::size_t concave_half_plane_triangle_count = 0;
+      Real candidate_volume = 0.0;
+      Real accepted_volume = 0.0;
+
+      const auto addTetFromTriangle = [&](const std::vector<Point> & triangle_points)
+      {
+        if (triangle_points.size() != 3)
+          return;
+
+        const Real split_volume6 =
+            tetVolume6(interior_point, triangle_points[0], triangle_points[1], triangle_points[2]);
+
+        if (std::abs(split_volume6) <= 1e-12)
+          return;
+
+        accepted_volume += std::abs(split_volume6) / 6.0;
+
+        if (split_volume6 > 0.0)
+          tets.push_back(
+              {interior_point, triangle_points[0], triangle_points[1], triangle_points[2]});
+        else
+          tets.push_back(
+              {interior_point, triangle_points[0], triangle_points[2], triangle_points[1]});
+      };
+
+      const auto addTetFromClippedPolygon = [&](const std::vector<Point> & polygon_points)
+      {
+        if (polygon_points.size() < 3)
+          return;
+
+        for (std::size_t i = 1; i + 1 < polygon_points.size(); ++i)
+          addTetFromTriangle({polygon_points[0], polygon_points[i], polygon_points[i + 1]});
+      };
 
       for (const auto & triangle : surface_triangles)
       {
         const Real volume6 = tetVolume6(interior_point, triangle[0], triangle[1], triangle[2]);
 
         if (std::abs(volume6) <= 1e-12)
+        {
+          ++flat_triangle_count;
           continue;
+        }
 
-        if (guard_concave_plane)
+        candidate_volume += std::abs(volume6) / 6.0;
+
+        bool split_for_concave_half_plane = false;
+        std::array<Real, 3> signed_distances;
+
+        if (guard_concave_half_plane)
         {
           unsigned int positive_count = 0;
           unsigned int negative_count = 0;
 
-          for (const auto & point : triangle)
+          for (const auto i : make_range(triangle.size()))
           {
-            const Real signed_distance = concave_plane_normal * (point - interior_point);
+            signed_distances[i] = concave_plane_normal * (triangle[i] - interior_point);
 
-            if (signed_distance > 1e-10)
+            if (signed_distances[i] > 1e-10)
               ++positive_count;
-            else if (signed_distance < -1e-10)
+            else if (signed_distances[i] < -1e-10)
               ++negative_count;
           }
 
           if (positive_count > 0 && negative_count > 0)
-            continue;
+          {
+            for (const auto i : make_range(triangle.size()))
+            {
+              const auto j = (i + 1) % triangle.size();
+              const Real signed_distance0 = signed_distances[i];
+              const Real signed_distance1 = signed_distances[j];
+
+              if (signed_distance0 > 1e-10 && signed_distance1 > 1e-10)
+                continue;
+              if (signed_distance0 < -1e-10 && signed_distance1 < -1e-10)
+                continue;
+
+              const Real denominator = signed_distance0 - signed_distance1;
+
+              if (std::abs(denominator) <= 1e-12)
+                continue;
+
+              const Real t = signed_distance0 / denominator;
+
+              if (t < -1e-10 || t > 1.0 + 1e-10)
+                continue;
+
+              const Point intersection = triangle[i] + t * (triangle[j] - triangle[i]);
+              const Real half_plane_distance =
+                  (intersection - concave_edge_midpoint) * concave_half_plane_direction;
+
+              if (half_plane_distance >= -1e-10 &&
+                  half_plane_distance <= concave_half_plane_distance + 1e-10)
+              {
+                split_for_concave_half_plane = true;
+                break;
+              }
+            }
+          }
         }
 
-        if (volume6 > 0.0)
-          tets.push_back({interior_point, triangle[0], triangle[1], triangle[2]});
-        else
-          tets.push_back({interior_point, triangle[0], triangle[2], triangle[1]});
+        if (split_for_concave_half_plane)
+        {
+          std::vector<Point> positive_polygon;
+          std::vector<Point> negative_polygon;
+
+          for (const auto i : make_range(triangle.size()))
+          {
+            const auto j = (i + 1) % triangle.size();
+            const Point & point0 = triangle[i];
+            const Point & point1 = triangle[j];
+            const Real signed_distance0 = signed_distances[i];
+            const Real signed_distance1 = signed_distances[j];
+
+            if (signed_distance0 >= -1e-10)
+              addUniquePoint(positive_polygon, point0);
+            if (signed_distance0 <= 1e-10)
+              addUniquePoint(negative_polygon, point0);
+
+            if ((signed_distance0 > 1e-10 && signed_distance1 < -1e-10) ||
+                (signed_distance0 < -1e-10 && signed_distance1 > 1e-10))
+            {
+              const Real t = signed_distance0 / (signed_distance0 - signed_distance1);
+              const Point intersection = point0 + t * (point1 - point0);
+
+              addUniquePoint(positive_polygon, intersection);
+              addUniquePoint(negative_polygon, intersection);
+            }
+          }
+
+          ++concave_half_plane_triangle_count;
+          addTetFromClippedPolygon(positive_polygon);
+          addTetFromClippedPolygon(negative_polygon);
+          continue;
+        }
+
+        addTetFromTriangle(triangle);
       }
 
       if (tets.empty())
         return false;
+
+      tetrahedralized_added_tet_count += tets.size();
+      tetrahedralized_flat_triangle_count += flat_triangle_count;
+      tetrahedralized_concave_half_plane_triangle_count += concave_half_plane_triangle_count;
+      tetrahedralized_candidate_volume += candidate_volume;
+      tetrahedralized_accepted_volume += accepted_volume;
 
       std::vector<Node *> local_nodes;
 
@@ -1020,10 +1162,6 @@ DualMeshGenerator::generate()
       if (edge_vector.norm() <= 1e-12)
         return false;
 
-      _console << "DualMeshGenerator 3D concave line nodes:\n"
-               << "  " << edge_point0 << "\n"
-               << "  " << edge_point1 << "\n";
-
       const auto distanceToConcaveEdge = [&](const Point & point) -> Real
       { return ((point - edge_point0).cross(edge_vector)).norm() / edge_vector.norm(); };
 
@@ -1046,8 +1184,6 @@ DualMeshGenerator::generate()
                 [&distanceToConcaveEdge](const Point & a, const Point & b)
                 { return distanceToConcaveEdge(a) < distanceToConcaveEdge(b); });
 
-      bool printed_first_body_pair = false;
-
       for (std::size_t body_i = 0; body_i < body_points.size(); ++body_i)
         for (std::size_t body_j = body_i + 1; body_j < body_points.size(); ++body_j)
         {
@@ -1060,14 +1196,6 @@ DualMeshGenerator::generate()
 
           if (edge_to_sides.find(body_edge) == edge_to_sides.end())
             continue;
-
-          if (!printed_first_body_pair)
-          {
-            _console << "DualMeshGenerator first 3D concave split body centroid pair:\n"
-                     << "  " << body_point0 << "\n"
-                     << "  " << body_point1 << "\n";
-            printed_first_body_pair = true;
-          }
 
           const auto concave_edge_sides_it = edge_to_sides.find(concave_edge);
           const auto body_edge_sides_it = edge_to_sides.find(body_edge);
@@ -1439,17 +1567,34 @@ DualMeshGenerator::generate()
       addPolyhedronOrSplit(polyhedron_side_points, body_centroid_points);
     }
 
-    _console << "DualMeshGenerator split " << split_nonconvex_polyhedron_count
-             << " non-convex 3D dual polyhedra.\n"
-             << "DualMeshGenerator tetrahedralized " << tetrahedralized_nonconvex_polyhedron_count
-             << " non-convex 3D dual polyhedra.\n"
+    _console << "DualMeshGenerator 3D raw output mesh volume before downstream converters: "
+             << meshVolume(*dualMesh) << "\n";
+
+    _console << "DualMeshGenerator tetrahedralized " << tetrahedralized_nonconvex_polyhedron_count
+             << " non-convex 3D dual polyhedra into " << tetrahedralized_added_tet_count
+             << " TET4 elements.\n"
              << "DualMeshGenerator skipped " << skipped_nonconvex_polyhedron_count
-             << " non-convex 3D dual polyhedra.\n";
+             << " non-convex 3D dual polyhedra.\n"
+             << "DualMeshGenerator tetrahedralized candidate fan volume: "
+             << tetrahedralized_candidate_volume << "\n"
+             << "DualMeshGenerator tetrahedralized accepted fan volume: "
+             << tetrahedralized_accepted_volume << "\n"
+             << "DualMeshGenerator tetrahedralized unaccounted fan volume: "
+             << tetrahedralized_candidate_volume - tetrahedralized_accepted_volume << "\n"
+             << "DualMeshGenerator tetrahedralized surface triangles: flat_skipped="
+             << tetrahedralized_flat_triangle_count
+             << " concave_half_plane_split=" << tetrahedralized_concave_half_plane_triangle_count
+             << "\n";
 
     std::map<std::string, std::size_t> elem_type_counts;
+    std::map<std::string, Real> elem_type_volumes;
 
-    for (const auto & elem : dualMesh->element_ptr_range())
-      ++elem_type_counts[Moose::stringify(elem->type())];
+    for (const auto & elem : dualMesh->active_element_ptr_range())
+    {
+      const auto elem_type = Moose::stringify(elem->type());
+      ++elem_type_counts[elem_type];
+      elem_type_volumes[elem_type] += elem->volume();
+    }
 
     _console << "DualMeshGenerator output element types:";
 
@@ -1458,6 +1603,14 @@ DualMeshGenerator::generate()
     else
       for (const auto & elem_type_count : elem_type_counts)
         _console << " " << elem_type_count.first << "=" << elem_type_count.second;
+
+    _console << "\nDualMeshGenerator output volume by element type:";
+
+    if (elem_type_volumes.empty())
+      _console << " none";
+    else
+      for (const auto & elem_type_volume : elem_type_volumes)
+        _console << " " << elem_type_volume.first << "=" << elem_type_volume.second;
 
     _console << "\n" << std::flush;
 
