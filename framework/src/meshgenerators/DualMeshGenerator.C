@@ -22,7 +22,6 @@
 #include "libmesh/elem.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -274,221 +273,6 @@ faceNormal3D(const std::vector<Point> & points, const Real tol = 1e-12)
   return Point();
 }
 
-// Computes six times the tetrahedron volume
-static Real
-tetVolume6(const Point & a, const Point & b, const Point & c, const Point & d)
-{
-  return (b - a).cross(c - a) * (d - a);
-}
-
-// Detects concave edges on 3D polyhedrons, avoiding C0Polyhedron mooseErrors for concave polyhedra
-static std::vector<std::pair<unsigned int, unsigned int>>
-findConcaveEdges3D(const std::vector<std::vector<Point>> & side_points,
-                   const std::vector<Point> & unique_points,
-                   const Real tol = 1e-12)
-{
-  if (side_points.size() < 4 || unique_points.size() < 4)
-    return {};
-
-  Point polyhedron_center;
-
-  for (const auto & point : unique_points)
-    polyhedron_center += point;
-
-  polyhedron_center /= unique_points.size();
-
-  const auto pointIndex = [&](const Point & point, unsigned int & index) -> bool
-  {
-    for (const auto i : make_range(unique_points.size()))
-      if (MooseUtils::absoluteFuzzyEqual(unique_points[i], point))
-      {
-        index = cast_int<unsigned int>(i);
-        return true;
-      }
-
-    return false;
-  };
-
-  std::vector<Point> face_centers(side_points.size());
-
-  for (const auto side_i : make_range(side_points.size()))
-  {
-    for (const auto & point : side_points[side_i])
-      face_centers[side_i] += point;
-
-    face_centers[side_i] /= side_points[side_i].size();
-
-    if (faceNormal3D(side_points[side_i], tol).norm() <= tol)
-      return {};
-  }
-
-  std::map<std::pair<unsigned int, unsigned int>, std::vector<unsigned int>> edge_to_sides;
-
-  for (const auto side_i : make_range(side_points.size()))
-    for (const auto point_i : make_range(side_points[side_i].size()))
-    {
-      unsigned int p0 = 0;
-      unsigned int p1 = 0;
-
-      if (!pointIndex(side_points[side_i][point_i], p0) ||
-          !pointIndex(side_points[side_i][(point_i + 1) % side_points[side_i].size()], p1))
-        return {};
-
-      edge_to_sides[{std::min(p0, p1), std::max(p0, p1)}].push_back(cast_int<unsigned int>(side_i));
-    }
-
-  std::vector<std::pair<Real, std::pair<unsigned int, unsigned int>>> scored_concave_edges;
-
-  for (const auto & edge_sides : edge_to_sides)
-  {
-    const auto & adjacent_sides = edge_sides.second;
-
-    if (adjacent_sides.size() != 2)
-      continue;
-
-    const unsigned int side0 = adjacent_sides[0];
-    const unsigned int side1 = adjacent_sides[1];
-    const Point edge_point0 = unique_points[edge_sides.first.first];
-    const Point edge_point1 = unique_points[edge_sides.first.second];
-    const Point edge_vector = edge_point1 - edge_point0;
-
-    if (edge_vector.norm() <= tol)
-      continue;
-
-    const Point edge_axis = edge_vector / edge_vector.norm();
-    const Point edge_midpoint = 0.5 * (edge_point0 + edge_point1);
-
-    const auto edgeRadialDirection = [&](const Point & point) -> Point
-    {
-      const Point offset = point - edge_midpoint;
-      return offset - (offset * edge_axis) * edge_axis;
-    };
-
-    Point side_direction0 = edgeRadialDirection(face_centers[side0]);
-    Point side_direction1 = edgeRadialDirection(face_centers[side1]);
-
-    if (side_direction0.norm() <= tol || side_direction1.norm() <= tol)
-      continue;
-
-    side_direction0 /= side_direction0.norm();
-    side_direction1 /= side_direction1.norm();
-
-    const auto signedAngle = [&](const Point & from, const Point & to) -> Real
-    { return std::atan2(edge_axis * from.cross(to), from * to); };
-
-    const Real side_angle = signedAngle(side_direction0, side_direction1);
-
-    if (std::abs(side_angle) <= 1e-10 || std::abs(std::abs(side_angle) - libMesh::pi) <= 1e-10)
-      continue;
-
-    const auto inSmallerWedge = [&](Point direction) -> bool
-    {
-      if (direction.norm() <= tol)
-        return true;
-
-      direction /= direction.norm();
-
-      const Real angle = signedAngle(side_direction0, direction);
-
-      if (side_angle > 0.0)
-        return angle >= -1e-10 && angle <= side_angle + 1e-10;
-      else
-        return angle <= 1e-10 && angle >= side_angle - 1e-10;
-    };
-
-    unsigned int inside_count = 0;
-    unsigned int outside_count = 0;
-
-    for (const auto & point : unique_points)
-    {
-      if (MooseUtils::absoluteFuzzyEqual(point, edge_point0) ||
-          MooseUtils::absoluteFuzzyEqual(point, edge_point1))
-        continue;
-
-      const Point direction = edgeRadialDirection(point);
-
-      if (direction.norm() <= tol)
-        continue;
-
-      if (inSmallerWedge(direction))
-        ++inside_count;
-      else
-        ++outside_count;
-    }
-
-    const Point center_direction = edgeRadialDirection(polyhedron_center);
-    const bool center_outside = center_direction.norm() > tol && !inSmallerWedge(center_direction);
-
-    if (!center_outside && outside_count <= inside_count)
-      continue;
-
-    const Real concave_score = (center_outside ? 1000.0 : 0.0) + static_cast<Real>(outside_count) -
-                               static_cast<Real>(inside_count);
-
-    scored_concave_edges.push_back({concave_score, edge_sides.first});
-  }
-
-  std::sort(scored_concave_edges.begin(),
-            scored_concave_edges.end(),
-            [](const auto & a, const auto & b) { return a.first > b.first; });
-
-  std::vector<std::pair<unsigned int, unsigned int>> concave_edges;
-
-  for (const auto & scored_edge : scored_concave_edges)
-    concave_edges.push_back(scored_edge.second);
-
-  return concave_edges;
-}
-
-static bool
-isConvexPolyhedron3D(const std::vector<std::vector<Point>> & sides, const Real tol = 1e-10)
-{
-  if (sides.size() < 4)
-    return false;
-
-  std::vector<Point> points;
-
-  for (const auto & side : sides)
-    for (const auto & point : side)
-      addUniquePoint(points, point, tol);
-
-  if (points.size() < 4)
-    return false;
-
-  Point center;
-
-  for (const auto & point : points)
-    center += point;
-
-  center /= points.size();
-
-  for (const auto & side : sides)
-  {
-    if (side.size() < 3)
-      return false;
-
-    const Point normal = faceNormal3D(side, tol);
-
-    if (normal.norm() <= tol)
-      return false;
-
-    Point outward_normal = normal;
-
-    if (normal * (center - side[0]) > tol)
-      outward_normal = -1.0 * normal;
-
-    for (const auto & point : points)
-    {
-      const Point offset = point - side[0];
-
-      if (outward_normal * offset > tol * std::max(Real(1.0), offset.norm()))
-        return false;
-    }
-  }
-
-  return true;
-}
-
 static void
 addUniqueDirection3D(std::vector<Point> & directions,
                      const Point & direction,
@@ -565,165 +349,81 @@ sortPointsAroundAxis3D(const std::vector<Point> & unsorted_points,
   return points;
 }
 
-static bool
-pointInTriangle3D(const Point & point,
-                  const Point & triangle_point0,
-                  const Point & triangle_point1,
-                  const Point & triangle_point2,
-                  const Point & normal,
-                  const Real tol = 1e-12)
+static Real
+polyhedronScale3D(const std::vector<std::vector<Point>> & side_points)
 {
-  if (normal.norm() <= tol)
-    return false;
+  Real scale = 1.0;
 
-  const Point unit_normal = normal / normal.norm();
-  const Real edge_scale = std::max(std::max((triangle_point1 - triangle_point0).norm(),
-                                            (triangle_point2 - triangle_point1).norm()),
-                                   std::max((triangle_point0 - triangle_point2).norm(), Real(1.0)));
-  const Real area_tol = tol * edge_scale * edge_scale;
+  for (const auto & side : side_points)
+    for (const auto i : index_range(side))
+      scale = std::max(scale, (side[(i + 1) % side.size()] - side[i]).norm());
 
-  const Real signed_area0 =
-      unit_normal * ((triangle_point1 - triangle_point0).cross(point - triangle_point0));
-  const Real signed_area1 =
-      unit_normal * ((triangle_point2 - triangle_point1).cross(point - triangle_point1));
-  const Real signed_area2 =
-      unit_normal * ((triangle_point0 - triangle_point2).cross(point - triangle_point2));
-
-  return signed_area0 > area_tol && signed_area1 > area_tol && signed_area2 > area_tol;
+  return scale;
 }
 
 static bool
-triangulatePolygon3D(const std::vector<Point> & polygon_points,
-                     std::vector<std::vector<Point>> & triangles,
-                     const Real tol = 1e-12)
+pointInsideTriangulatedSurface3D(const Point & point,
+                                 const std::vector<std::vector<Point>> & surface_triangles,
+                                 const Real tol = 1e-12)
 {
-  if (polygon_points.size() < 3)
-    return false;
+  Real solid_angle = 0.0;
 
-  if (polygon_points.size() == 3)
+  for (const auto & triangle : surface_triangles)
   {
-    if (hasNonzeroArea3D(polygon_points, tol))
-      triangles.push_back(polygon_points);
+    if (triangle.size() != 3)
+      continue;
 
-    return true;
+    const Point a = triangle[0] - point;
+    const Point b = triangle[1] - point;
+    const Point c = triangle[2] - point;
+    const Real a_norm = a.norm();
+    const Real b_norm = b.norm();
+    const Real c_norm = c.norm();
+
+    if (a_norm <= tol || b_norm <= tol || c_norm <= tol)
+      return true;
+
+    const Real numerator = a * b.cross(c);
+    const Real denominator =
+        a_norm * b_norm * c_norm + (a * b) * c_norm + (b * c) * a_norm + (c * a) * b_norm;
+
+    if (std::abs(numerator) <= tol && std::abs(denominator) <= tol)
+      continue;
+
+    solid_angle += 2.0 * std::atan2(numerator, denominator);
   }
 
-  Point normal = faceNormal3D(polygon_points, tol);
+  return std::abs(solid_angle) > libMesh::pi;
+}
 
-  if (normal.norm() <= tol)
-    return false;
+static Real
+tetVolume6(const Point & point0, const Point & point1, const Point & point2, const Point & point3)
+{
+  return (point1 - point0).cross(point2 - point0) * (point3 - point0);
+}
 
-  normal /= normal.norm();
+static bool
+surfaceTriangles3D(const std::vector<std::vector<Point>> & side_points,
+                   std::vector<std::vector<Point>> & surface_triangles,
+                   const Real tol = 1e-12)
+{
+  surface_triangles.clear();
 
-  Real edge_scale = 1.0;
-
-  for (const auto i : index_range(polygon_points))
-    edge_scale = std::max(
-        edge_scale, (polygon_points[(i + 1) % polygon_points.size()] - polygon_points[i]).norm());
-
-  const Real area_tol = tol * edge_scale * edge_scale;
-  std::vector<std::size_t> remaining_points;
-  remaining_points.reserve(polygon_points.size());
-
-  for (const auto i : index_range(polygon_points))
-    remaining_points.push_back(i);
-
-  while (remaining_points.size() > 3)
+  for (const auto & side : side_points)
   {
-    bool clipped_ear = false;
+    if (side.size() < 3)
+      continue;
 
-    for (const auto i : index_range(remaining_points))
+    for (const auto i : make_range(std::size_t(1), side.size() - 1))
     {
-      const auto previous_i = (i + remaining_points.size() - 1) % remaining_points.size();
-      const auto next_i = (i + 1) % remaining_points.size();
-      const Point & previous_point = polygon_points[remaining_points[previous_i]];
-      const Point & current_point = polygon_points[remaining_points[i]];
-      const Point & next_point = polygon_points[remaining_points[next_i]];
+      const std::vector<Point> triangle = {side[0], side[i], side[i + 1]};
 
-      const Real corner_area =
-          normal * ((current_point - previous_point).cross(next_point - previous_point));
-
-      if (corner_area <= area_tol)
-        continue;
-
-      bool contains_other_point = false;
-
-      for (const auto candidate_i : index_range(remaining_points))
-      {
-        if (candidate_i == previous_i || candidate_i == i || candidate_i == next_i)
-          continue;
-
-        if (pointInTriangle3D(polygon_points[remaining_points[candidate_i]],
-                              previous_point,
-                              current_point,
-                              next_point,
-                              normal,
-                              tol))
-        {
-          contains_other_point = true;
-          break;
-        }
-      }
-
-      if (contains_other_point)
-        continue;
-
-      const std::vector<Point> triangle_points = {previous_point, current_point, next_point};
-
-      if (hasNonzeroArea3D(triangle_points, tol))
-        triangles.push_back(triangle_points);
-
-      remaining_points.erase(remaining_points.begin() + i);
-      clipped_ear = true;
-      break;
+      if (hasNonzeroArea3D(triangle, tol))
+        surface_triangles.push_back(triangle);
     }
-
-    if (!clipped_ear)
-      return false;
   }
 
-  const std::vector<Point> triangle_points = {polygon_points[remaining_points[0]],
-                                              polygon_points[remaining_points[1]],
-                                              polygon_points[remaining_points[2]]};
-
-  if (hasNonzeroArea3D(triangle_points, tol))
-    triangles.push_back(triangle_points);
-
-  return true;
-}
-
-// Triangulates troublesome polyhedrons to avoid C0Polyhedron error
-static void
-addTriangulatedSidePoints3D(std::vector<std::vector<Point>> & sides,
-                            const std::vector<Point> & side_points,
-                            const Real tol = 1e-12)
-{
-  std::vector<Point> unique_side_points;
-
-  for (const auto & point : side_points)
-    addUniquePoint(unique_side_points, point, tol);
-
-  if (unique_side_points.size() < 3 || !hasNonzeroArea3D(unique_side_points, tol))
-    return;
-
-  const Point normal = faceNormal3D(unique_side_points, tol);
-  std::vector<Point> sorted_side_points =
-      normal.norm() > tol ? sortPointsAroundAxis3D(unique_side_points, normal, tol)
-                          : unique_side_points;
-
-  if (sorted_side_points.size() == 3)
-  {
-    sides.push_back(sorted_side_points);
-    return;
-  }
-
-  std::vector<std::vector<Point>> triangle_points;
-
-  if (!triangulatePolygon3D(sorted_side_points, triangle_points, tol))
-    return;
-
-  for (const auto & triangle : triangle_points)
-    sides.push_back(triangle);
+  return !surface_triangles.empty();
 }
 
 std::unique_ptr<MeshBase>
@@ -811,10 +511,10 @@ DualMeshGenerator::generate()
       for (const auto n : make_range(elem->n_vertices()))
         source_node_to_elems[elem->node_id(n)].push_back(elem);
 
-    const auto tryAddPolyhedron =
-        [&](MeshBase & mesh, const std::vector<std::vector<Point>> & polyhedron_side_points) -> bool
+    const auto tryAddPolyhedron = [&](MeshBase & mesh,
+                                      const std::vector<std::vector<Point>> & side_points) -> bool
     {
-      if (polyhedron_side_points.size() < 4)
+      if (side_points.size() < 4)
         return false;
 
       std::vector<Node *> local_nodes;
@@ -832,16 +532,16 @@ DualMeshGenerator::generate()
         return node;
       };
 
-      sides.reserve(polyhedron_side_points.size());
+      sides.reserve(side_points.size());
 
-      for (const auto & side_points : polyhedron_side_points)
+      for (const auto & side : side_points)
       {
-        auto side = std::make_shared<libMesh::C0Polygon>(side_points.size());
+        auto polygon = std::make_shared<libMesh::C0Polygon>(side.size());
 
-        for (const auto i : make_range(side_points.size()))
-          side->set_node(i, getLocalNode(side_points[i]));
+        for (const auto i : index_range(side))
+          polygon->set_node(i, getLocalNode(side[i]));
 
-        sides.push_back(side);
+        sides.push_back(polygon);
       }
 
       libmesh_try
@@ -860,258 +560,205 @@ DualMeshGenerator::generate()
       return true;
     };
 
-    const auto addPolyhedron =
-        [&](const std::vector<std::vector<Point>> & polyhedron_side_points) -> bool
+    const auto addPolyhedron = [&](const std::vector<std::vector<Point>> & side_points)
     {
-      if (polyhedron_side_points.size() < 4)
-        return false;
-
       auto trial_mesh = buildReplicatedMesh(3);
 
-      if (!tryAddPolyhedron(*trial_mesh, polyhedron_side_points))
+      if (!tryAddPolyhedron(*trial_mesh, side_points))
         return false;
 
-      return tryAddPolyhedron(*dualMesh, polyhedron_side_points);
+      return tryAddPolyhedron(*dualMesh, side_points);
     };
-    // If all else fails, we'll have to add an interior point, since not all polyhedrons are
-    // tetrahedralizable with vertex preservation
+
     const auto addTetrahedralizedPolyhedron =
-        [&](const std::vector<std::vector<Point>> & side_points,
-            const std::vector<Point> & body_centroid_points) -> bool
+        [&](const std::vector<std::vector<Point>> & side_points) -> bool
     {
+      if (side_points.size() < 4)
+        return false;
+
+      const Real tol = std::max(_geometry_relative_tol, Real(1e-12));
+      const Real length_tol = tol * polyhedronScale3D(side_points);
+      const Real volume_tol = length_tol * length_tol * length_tol;
       std::vector<std::vector<Point>> surface_triangles;
 
-      for (const auto & side : side_points)
-        addTriangulatedSidePoints3D(surface_triangles, side);
-
-      if (surface_triangles.size() < 4)
+      if (!surfaceTriangles3D(side_points, surface_triangles, length_tol))
         return false;
 
       std::vector<Point> unique_points;
 
+      for (const auto & side : side_points)
+        for (const auto & point : side)
+          addUniquePoint(unique_points, point, length_tol);
+
+      if (unique_points.size() < 4)
+        return false;
+
+      Point vertex_center;
+
+      for (const auto & point : unique_points)
+        vertex_center += point;
+
+      vertex_center /= unique_points.size();
+
+      Point surface_center;
+      Real surface_weight = 0.0;
+
       for (const auto & triangle : surface_triangles)
-        for (const auto & point : triangle)
-          addUniquePoint(unique_points, point);
-
-      Point interior_point;
-      std::vector<Point> interior_point_candidates;
-
-      for (const auto & body_centroid_point : body_centroid_points)
-        for (const auto & point : unique_points)
-          if (MooseUtils::absoluteFuzzyEqual(body_centroid_point, point))
-          {
-            addUniquePoint(interior_point_candidates, point);
-            break;
-          }
-
-      const auto & point_source =
-          interior_point_candidates.size() >= 2 ? interior_point_candidates : unique_points;
-
-      for (const auto & point : point_source)
-        interior_point += point;
-
-      interior_point /= point_source.size();
-
-      struct ConcaveHalfPlaneGuard
       {
-        Point plane_normal;
-        Point half_plane_direction;
-        Point edge_midpoint;
-        Real half_plane_distance;
+        const Real triangle_weight =
+            (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]).norm();
+
+        surface_center += triangle_weight * (triangle[0] + triangle[1] + triangle[2]) / 3.0;
+        surface_weight += triangle_weight;
+      }
+
+      if (surface_weight > length_tol * length_tol)
+        surface_center /= surface_weight;
+      else
+        surface_center = vertex_center;
+
+      std::vector<Point> candidate_points;
+
+      const auto addCandidatePoint = [&](const Point & point)
+      {
+        if (!pointInsideTriangulatedSurface3D(point, surface_triangles, length_tol))
+          return;
+
+        addUniquePoint(candidate_points, point, length_tol);
       };
 
-      std::vector<ConcaveHalfPlaneGuard> concave_half_plane_guards;
+      addCandidatePoint(vertex_center);
+      addCandidatePoint(surface_center);
+      addCandidatePoint(0.5 * (vertex_center + surface_center));
 
-      for (const auto & concave_edge : findConcaveEdges3D(side_points, unique_points))
-      {
-        const Point & edge_point0 = unique_points[concave_edge.first];
-        const Point & edge_point1 = unique_points[concave_edge.second];
-        const Point concave_edge_vector = edge_point1 - edge_point0;
-
-        if (concave_edge_vector.norm() <= 1e-12)
-          continue;
-
-        const Point concave_edge_axis = concave_edge_vector / concave_edge_vector.norm();
-        const Point concave_edge_midpoint = 0.5 * (edge_point0 + edge_point1);
-        Point concave_half_plane_direction = interior_point - concave_edge_midpoint;
-        concave_half_plane_direction -=
-            (concave_half_plane_direction * concave_edge_axis) * concave_edge_axis;
-        const Real concave_half_plane_distance = concave_half_plane_direction.norm();
-        Point concave_plane_normal = concave_edge_vector.cross(interior_point - edge_point0);
-
-        if (concave_plane_normal.norm() > 1e-12 && concave_half_plane_distance > 1e-12)
+      for (const auto & point : unique_points)
+        for (const auto fraction : {0.25, 0.5, 0.75})
         {
-          concave_plane_normal /= concave_plane_normal.norm();
-          concave_half_plane_direction /= concave_half_plane_distance;
-          concave_half_plane_guards.push_back({concave_plane_normal,
-                                               concave_half_plane_direction,
-                                               concave_edge_midpoint,
-                                               concave_half_plane_distance});
+          addCandidatePoint(vertex_center + fraction * (point - vertex_center));
+          addCandidatePoint(surface_center + fraction * (point - surface_center));
+        }
+
+      for (const auto & triangle : surface_triangles)
+      {
+        const Point triangle_center = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
+        Point triangle_normal = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
+
+        for (const auto fraction : {0.25, 0.5, 0.75})
+        {
+          addCandidatePoint(vertex_center + fraction * (triangle_center - vertex_center));
+          addCandidatePoint(surface_center + fraction * (triangle_center - surface_center));
+        }
+
+        if (triangle_normal.norm() > length_tol)
+        {
+          triangle_normal /= triangle_normal.norm();
+
+          Real triangle_scale = 1.0;
+
+          for (const auto i : index_range(triangle))
+            triangle_scale = std::max(triangle_scale,
+                                      (triangle[(i + 1) % triangle.size()] - triangle[i]).norm());
+
+          for (const auto sign : {-1.0, 1.0})
+            for (const auto fraction : {0.05, 0.1, 0.2, 0.35})
+              addCandidatePoint(triangle_center +
+                                sign * fraction * triangle_scale * triangle_normal);
         }
       }
 
-      std::vector<std::array<Point, 4>> tets;
+      if (candidate_points.empty())
+        return false;
 
-      const auto addTetFromTriangle = [&](const std::vector<Point> & triangle_points)
+      const auto candidateCoversTriangle =
+          [&](const Point & candidate_point, const std::vector<Point> & triangle)
       {
-        if (triangle_points.size() != 3)
-          return;
+        if (std::abs(tetVolume6(candidate_point, triangle[0], triangle[1], triangle[2])) <=
+            volume_tol)
+          return false;
 
-        const Real split_volume6 =
-            tetVolume6(interior_point, triangle_points[0], triangle_points[1], triangle_points[2]);
+        const Point triangle_center = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
 
-        if (std::abs(split_volume6) <= 1e-12)
-          return;
+        for (const auto fraction : {0.25, 0.5})
+          if (!pointInsideTriangulatedSurface3D(candidate_point +
+                                                    fraction * (triangle_center - candidate_point),
+                                                surface_triangles,
+                                                length_tol))
+            return false;
 
-        if (split_volume6 > 0.0)
-          tets.push_back(
-              {interior_point, triangle_points[0], triangle_points[1], triangle_points[2]});
-        else
-          tets.push_back(
-              {interior_point, triangle_points[0], triangle_points[2], triangle_points[1]});
+        const Point tet_center = (candidate_point + triangle[0] + triangle[1] + triangle[2]) / 4.0;
+
+        return pointInsideTriangulatedSurface3D(tet_center, surface_triangles, length_tol);
       };
 
-      const auto addTetFromClippedPolygon = [&](const std::vector<Point> & polygon_points)
+      const auto candidateWeaklyCoversTriangle =
+          [&](const Point & candidate_point, const std::vector<Point> & triangle)
       {
-        if (polygon_points.size() < 3)
-          return;
+        if (std::abs(tetVolume6(candidate_point, triangle[0], triangle[1], triangle[2])) <=
+            volume_tol)
+          return false;
 
-        for (const auto i : make_range(std::size_t(1), polygon_points.size() - 1))
-          addTetFromTriangle({polygon_points[0], polygon_points[i], polygon_points[i + 1]});
+        const Point tet_center = (candidate_point + triangle[0] + triangle[1] + triangle[2]) / 4.0;
+
+        return pointInsideTriangulatedSurface3D(tet_center, surface_triangles, length_tol);
       };
 
-      const auto splitPolygonByConcaveHalfPlane =
-          [&](const std::vector<Point> & polygon,
-              const ConcaveHalfPlaneGuard & guard,
-              std::vector<std::vector<Point>> & split_polygons)
+      std::vector<bool> covered_triangles(surface_triangles.size(), false);
+      std::vector<std::pair<Point, std::vector<std::size_t>>> selected_candidate_triangles;
+
+      while (std::find(covered_triangles.begin(), covered_triangles.end(), false) !=
+             covered_triangles.end())
       {
-        if (polygon.size() < 3)
-          return;
+        std::vector<std::size_t> best_triangle_indices;
+        Point best_candidate_point;
 
-        std::vector<Real> signed_distances(polygon.size());
-        unsigned int positive_count = 0;
-        unsigned int negative_count = 0;
-
-        for (const auto i : index_range(polygon))
+        for (const auto & candidate_point : candidate_points)
         {
-          signed_distances[i] = guard.plane_normal * (polygon[i] - interior_point);
+          std::vector<std::size_t> candidate_triangle_indices;
 
-          if (signed_distances[i] > 1e-10)
-            ++positive_count;
-          else if (signed_distances[i] < -1e-10)
-            ++negative_count;
+          for (const auto triangle_i : index_range(surface_triangles))
+            if (!covered_triangles[triangle_i] &&
+                candidateCoversTriangle(candidate_point, surface_triangles[triangle_i]))
+              candidate_triangle_indices.push_back(triangle_i);
+
+          if (candidate_triangle_indices.size() > best_triangle_indices.size())
+          {
+            best_candidate_point = candidate_point;
+            best_triangle_indices = candidate_triangle_indices;
+          }
         }
 
-        bool split_for_concave_half_plane = false;
-
-        if (positive_count > 0 && negative_count > 0)
-        {
-          for (const auto i : index_range(polygon))
+        if (best_triangle_indices.empty())
+          for (const auto & candidate_point : candidate_points)
           {
-            const auto j = (i + 1) % polygon.size();
-            const Real signed_distance0 = signed_distances[i];
-            const Real signed_distance1 = signed_distances[j];
+            std::vector<std::size_t> candidate_triangle_indices;
 
-            if (signed_distance0 > 1e-10 && signed_distance1 > 1e-10)
-              continue;
-            if (signed_distance0 < -1e-10 && signed_distance1 < -1e-10)
-              continue;
+            for (const auto triangle_i : index_range(surface_triangles))
+              if (!covered_triangles[triangle_i] &&
+                  candidateWeaklyCoversTriangle(candidate_point, surface_triangles[triangle_i]))
+                candidate_triangle_indices.push_back(triangle_i);
 
-            const Real denominator = signed_distance0 - signed_distance1;
-
-            if (std::abs(denominator) <= 1e-12)
-              continue;
-
-            const Real t = signed_distance0 / denominator;
-
-            if (t < -1e-10 || t > 1.0 + 1e-10)
-              continue;
-
-            const Point intersection = polygon[i] + t * (polygon[j] - polygon[i]);
-            const Real half_plane_distance =
-                (intersection - guard.edge_midpoint) * guard.half_plane_direction;
-
-            if (half_plane_distance >= -1e-10 &&
-                half_plane_distance <= guard.half_plane_distance + 1e-10)
+            if (candidate_triangle_indices.size() > best_triangle_indices.size())
             {
-              split_for_concave_half_plane = true;
-              break;
+              best_candidate_point = candidate_point;
+              best_triangle_indices = candidate_triangle_indices;
             }
           }
-        }
 
-        if (!split_for_concave_half_plane)
-        {
-          split_polygons.push_back(polygon);
-          return;
-        }
+        if (best_triangle_indices.empty())
+          return false;
 
-        std::vector<Point> positive_polygon;
-        std::vector<Point> negative_polygon;
+        for (const auto triangle_i : best_triangle_indices)
+          covered_triangles[triangle_i] = true;
 
-        for (const auto i : index_range(polygon))
-        {
-          const auto j = (i + 1) % polygon.size();
-          const Point & point0 = polygon[i];
-          const Point & point1 = polygon[j];
-          const Real signed_distance0 = signed_distances[i];
-          const Real signed_distance1 = signed_distances[j];
-
-          if (signed_distance0 >= -1e-10)
-            addUniquePoint(positive_polygon, point0);
-          if (signed_distance0 <= 1e-10)
-            addUniquePoint(negative_polygon, point0);
-
-          if ((signed_distance0 > 1e-10 && signed_distance1 < -1e-10) ||
-              (signed_distance0 < -1e-10 && signed_distance1 > 1e-10))
-          {
-            const Real t = signed_distance0 / (signed_distance0 - signed_distance1);
-            const Point intersection = point0 + t * (point1 - point0);
-
-            addUniquePoint(positive_polygon, intersection);
-            addUniquePoint(negative_polygon, intersection);
-          }
-        }
-
-        if (positive_polygon.size() >= 3)
-          split_polygons.push_back(positive_polygon);
-        if (negative_polygon.size() >= 3)
-          split_polygons.push_back(negative_polygon);
-      };
-
-      for (const auto & triangle : surface_triangles)
-      {
-        const Real volume6 = tetVolume6(interior_point, triangle[0], triangle[1], triangle[2]);
-
-        if (std::abs(volume6) <= 1e-12)
-          continue;
-
-        std::vector<std::vector<Point>> clipped_polygons = {
-            {triangle[0], triangle[1], triangle[2]}};
-
-        for (const auto & guard : concave_half_plane_guards)
-        {
-          std::vector<std::vector<Point>> next_clipped_polygons;
-
-          for (const auto & clipped_polygon : clipped_polygons)
-            splitPolygonByConcaveHalfPlane(clipped_polygon, guard, next_clipped_polygons);
-
-          clipped_polygons = std::move(next_clipped_polygons);
-        }
-
-        for (const auto & clipped_polygon : clipped_polygons)
-          addTetFromClippedPolygon(clipped_polygon);
+        selected_candidate_triangles.push_back({best_candidate_point, best_triangle_indices});
       }
-
-      if (tets.empty())
-        return false;
 
       std::vector<Node *> local_nodes;
 
       const auto getLocalNode = [&](const Point & point)
       {
         for (auto * const node : local_nodes)
-          if (MooseUtils::absoluteFuzzyEqual(*node, point))
+          if (MooseUtils::absoluteFuzzyEqual(*node, point, length_tol))
             return node;
 
         Node * const node = dualMesh->add_point(point);
@@ -1120,419 +767,52 @@ DualMeshGenerator::generate()
         return node;
       };
 
-      for (const auto & tet_points : tets)
+      for (const auto & candidate_triangles : selected_candidate_triangles)
       {
-        auto tet = std::make_unique<Tet4>();
+        Node * const interior_node = getLocalNode(candidate_triangles.first);
 
-        for (const auto i : make_range(tet_points.size()))
-          tet->set_node(i, getLocalNode(tet_points[i]));
-
-        dualMesh->add_elem(std::move(tet));
-      }
-
-      return true;
-    };
-    // Default treatment for concave edge polyhedra; if we don't *need* to add an interior point,
-    // let's not.
-    const auto splitConcaveEdgePolyhedron =
-        [&](const std::vector<std::vector<Point>> & side_points,
-            const std::vector<Point> & body_centroid_points,
-            std::vector<std::vector<Point>> & positive_side_points,
-            std::vector<std::vector<Point>> & negative_side_points) -> bool
-    {
-      if (side_points.size() < 4 || body_centroid_points.empty())
-        return false;
-
-      positive_side_points.clear();
-      negative_side_points.clear();
-
-      std::vector<Point> unique_points;
-
-      for (const auto & side : side_points)
-        for (const auto & point : side)
-          addUniquePoint(unique_points, point);
-
-      if (unique_points.size() < 4)
-        return false;
-
-      Point polyhedron_center;
-
-      for (const auto & point : unique_points)
-        polyhedron_center += point;
-
-      polyhedron_center /= unique_points.size();
-
-      const auto pointIndex = [&](const Point & point) -> unsigned int
-      {
-        for (const auto i : make_range(unique_points.size()))
-          if (MooseUtils::absoluteFuzzyEqual(unique_points[i], point))
-            return cast_int<unsigned int>(i);
-
-        mooseAssert(false, "Could not find point while splitting non-convex 3D dual polyhedron.");
-        return 0;
-      };
-
-      std::vector<Point> face_centers(side_points.size());
-
-      for (const auto side_i : make_range(side_points.size()))
-      {
-        for (const auto & point : side_points[side_i])
-          face_centers[side_i] += point;
-
-        face_centers[side_i] /= side_points[side_i].size();
-
-        Point normal = faceNormal3D(side_points[side_i]);
-
-        if (normal.norm() <= 1e-12)
-          return false;
-      }
-
-      std::map<std::pair<unsigned int, unsigned int>, std::vector<unsigned int>> edge_to_sides;
-
-      for (const auto side_i : make_range(side_points.size()))
-        for (const auto point_i : make_range(side_points[side_i].size()))
+        for (const auto triangle_i : candidate_triangles.second)
         {
-          const unsigned int p0 = pointIndex(side_points[side_i][point_i]);
-          const unsigned int p1 =
-              pointIndex(side_points[side_i][(point_i + 1) % side_points[side_i].size()]);
+          const auto & triangle = surface_triangles[triangle_i];
 
-          edge_to_sides[{std::min(p0, p1), std::max(p0, p1)}].push_back(
-              cast_int<unsigned int>(side_i));
-        }
-
-      bool found_concave_edge = false;
-      std::pair<unsigned int, unsigned int> concave_edge;
-      Real best_concave_score = 0.0;
-
-      for (const auto & edge_sides : edge_to_sides)
-      {
-        const auto & adjacent_sides = edge_sides.second;
-
-        if (adjacent_sides.size() != 2)
-          continue;
-
-        const unsigned int side0 = adjacent_sides[0];
-        const unsigned int side1 = adjacent_sides[1];
-        const Point edge_point0 = unique_points[edge_sides.first.first];
-        const Point edge_point1 = unique_points[edge_sides.first.second];
-        const Point edge_vector = edge_point1 - edge_point0;
-
-        if (edge_vector.norm() <= 1e-12)
-          continue;
-
-        const Point edge_axis = edge_vector / edge_vector.norm();
-        const Point edge_midpoint = 0.5 * (edge_point0 + edge_point1);
-
-        const auto edgeRadialDirection = [&](const Point & point) -> Point
-        {
-          const Point offset = point - edge_midpoint;
-          return offset - (offset * edge_axis) * edge_axis;
-        };
-
-        Point side_direction0 = edgeRadialDirection(face_centers[side0]);
-        Point side_direction1 = edgeRadialDirection(face_centers[side1]);
-
-        if (side_direction0.norm() <= 1e-12 || side_direction1.norm() <= 1e-12)
-          continue;
-
-        side_direction0 /= side_direction0.norm();
-        side_direction1 /= side_direction1.norm();
-
-        const auto signedAngle = [&](const Point & from, const Point & to) -> Real
-        { return std::atan2(edge_axis * from.cross(to), from * to); };
-
-        const Real side_angle = signedAngle(side_direction0, side_direction1);
-
-        if (std::abs(side_angle) <= 1e-10 || std::abs(std::abs(side_angle) - libMesh::pi) <= 1e-10)
-          continue;
-
-        const auto inSmallerWedge = [&](Point direction) -> bool
-        {
-          if (direction.norm() <= 1e-12)
-            return true;
-
-          direction /= direction.norm();
-
-          const Real angle = signedAngle(side_direction0, direction);
-
-          if (side_angle > 0.0)
-            return angle >= -1e-10 && angle <= side_angle + 1e-10;
-          else
-            return angle <= 1e-10 && angle >= side_angle - 1e-10;
-        };
-
-        unsigned int inside_count = 0;
-        unsigned int outside_count = 0;
-
-        for (const auto & point : unique_points)
-        {
-          if (MooseUtils::absoluteFuzzyEqual(point, edge_point0) ||
-              MooseUtils::absoluteFuzzyEqual(point, edge_point1))
+          if (std::abs(tetVolume6(
+                  candidate_triangles.first, triangle[0], triangle[1], triangle[2])) <= volume_tol)
             continue;
 
-          const Point direction = edgeRadialDirection(point);
+          auto tet = std::make_unique<Tet4>();
+          tet->set_node(0) = interior_node;
+          tet->set_node(1) = getLocalNode(triangle[0]);
 
-          if (direction.norm() <= 1e-12)
-            continue;
-
-          if (inSmallerWedge(direction))
-            ++inside_count;
-          else
-            ++outside_count;
-        }
-
-        const Point center_direction = edgeRadialDirection(polyhedron_center);
-        const bool center_outside =
-            center_direction.norm() > 1e-12 && !inSmallerWedge(center_direction);
-
-        if (!center_outside && outside_count <= inside_count)
-          continue;
-
-        const Real concave_score = (center_outside ? 1000.0 : 0.0) +
-                                   static_cast<Real>(outside_count) -
-                                   static_cast<Real>(inside_count);
-
-        if (concave_score > best_concave_score)
-        {
-          found_concave_edge = true;
-          best_concave_score = concave_score;
-          concave_edge = edge_sides.first;
-        }
-      }
-
-      if (!found_concave_edge)
-        return false;
-
-      const Point edge_point0 = unique_points[concave_edge.first];
-      const Point edge_point1 = unique_points[concave_edge.second];
-      const Point edge_vector = edge_point1 - edge_point0;
-
-      if (edge_vector.norm() <= 1e-12)
-        return false;
-
-      const auto distanceToConcaveEdge = [&](const Point & point) -> Real
-      { return ((point - edge_point0).cross(edge_vector)).norm() / edge_vector.norm(); };
-
-      std::vector<Point> body_points;
-
-      for (const auto & point : body_centroid_points)
-        for (const auto & unique_point : unique_points)
-          if (MooseUtils::absoluteFuzzyEqual(point, unique_point) &&
-              !MooseUtils::absoluteFuzzyEqual(unique_point, edge_point0) &&
-              !MooseUtils::absoluteFuzzyEqual(unique_point, edge_point1))
+          if (tetVolume6(candidate_triangles.first, triangle[0], triangle[1], triangle[2]) > 0.0)
           {
-            addUniquePoint(body_points, unique_point);
-            break;
+            tet->set_node(2) = getLocalNode(triangle[1]);
+            tet->set_node(3) = getLocalNode(triangle[2]);
+          }
+          else
+          {
+            tet->set_node(2) = getLocalNode(triangle[2]);
+            tet->set_node(3) = getLocalNode(triangle[1]);
           }
 
-      if (body_points.size() < 2)
-        return false;
-
-      std::sort(body_points.begin(),
-                body_points.end(),
-                [&distanceToConcaveEdge](const Point & a, const Point & b)
-                { return distanceToConcaveEdge(a) < distanceToConcaveEdge(b); });
-
-      for (const auto body_i : index_range(body_points))
-        for (const auto body_j : make_range(body_i + 1, body_points.size()))
-        {
-          const Point & body_point0 = body_points[body_i];
-          const Point & body_point1 = body_points[body_j];
-          const unsigned int body_point0_index = pointIndex(body_point0);
-          const unsigned int body_point1_index = pointIndex(body_point1);
-          const auto body_edge = std::make_pair(std::min(body_point0_index, body_point1_index),
-                                                std::max(body_point0_index, body_point1_index));
-
-          if (edge_to_sides.find(body_edge) == edge_to_sides.end())
-            continue;
-
-          const auto concave_edge_sides_it = edge_to_sides.find(concave_edge);
-          const auto body_edge_sides_it = edge_to_sides.find(body_edge);
-
-          if (concave_edge_sides_it == edge_to_sides.end() ||
-              body_edge_sides_it == edge_to_sides.end() ||
-              concave_edge_sides_it->second.size() != 2 || body_edge_sides_it->second.size() != 2)
-            continue;
-
-          const auto isCutEdge = [&](const std::pair<unsigned int, unsigned int> & edge)
-          { return edge == concave_edge || edge == body_edge; };
-
-          const bool first_diagonal =
-              (edge_point0 - body_point1).norm() <= (edge_point1 - body_point0).norm();
-          std::vector<std::vector<Point>> split_faces;
-
-          if (first_diagonal)
-            split_faces = {{edge_point0, edge_point1, body_point1},
-                           {edge_point0, body_point1, body_point0}};
-          else
-            split_faces = {{edge_point0, edge_point1, body_point0},
-                           {edge_point1, body_point1, body_point0}};
-
-          std::vector<bool> positive_piece_side(side_points.size(), false);
-          std::vector<unsigned int> side_stack = {concave_edge_sides_it->second[0]};
-          positive_piece_side[side_stack.back()] = true;
-
-          while (!side_stack.empty())
-          {
-            const unsigned int side_i = side_stack.back();
-            side_stack.pop_back();
-
-            for (const auto point_i : make_range(side_points[side_i].size()))
-            {
-              const unsigned int point0 = pointIndex(side_points[side_i][point_i]);
-              const unsigned int point1 =
-                  pointIndex(side_points[side_i][(point_i + 1) % side_points[side_i].size()]);
-              const auto side_edge =
-                  std::make_pair(std::min(point0, point1), std::max(point0, point1));
-
-              if (isCutEdge(side_edge))
-                continue;
-
-              const auto adjacent_sides_it = edge_to_sides.find(side_edge);
-
-              if (adjacent_sides_it == edge_to_sides.end())
-                continue;
-
-              for (const auto adjacent_side : adjacent_sides_it->second)
-                if (!positive_piece_side[adjacent_side])
-                {
-                  positive_piece_side[adjacent_side] = true;
-                  side_stack.push_back(adjacent_side);
-                }
-            }
-          }
-
-          if (positive_piece_side[concave_edge_sides_it->second[1]] ||
-              positive_piece_side[body_edge_sides_it->second[0]] ==
-                  positive_piece_side[body_edge_sides_it->second[1]])
-            continue;
-
-          std::vector<std::vector<Point>> positive_piece_side_points;
-          std::vector<std::vector<Point>> negative_piece_side_points;
-
-          for (const auto side_i : make_range(side_points.size()))
-            if (positive_piece_side[side_i])
-              addSidePoints3D(positive_piece_side_points, side_points[side_i]);
-            else
-              addSidePoints3D(negative_piece_side_points, side_points[side_i]);
-
-          for (auto split_face : split_faces)
-          {
-            addSidePoints3D(positive_piece_side_points, split_face);
-            std::reverse(split_face.begin(), split_face.end());
-            addSidePoints3D(negative_piece_side_points, split_face);
-          }
-
-          if (positive_piece_side_points.size() < 4 || negative_piece_side_points.size() < 4)
-            continue;
-
-          positive_side_points = std::move(positive_piece_side_points);
-          negative_side_points = std::move(negative_piece_side_points);
-
-          return true;
-        }
-
-      return false;
-    };
-
-    const auto collectConvexSplitPolyhedra =
-        [&](const auto & self,
-            const std::vector<std::vector<Point>> & side_points,
-            const std::vector<Point> & body_centroid_points,
-            std::vector<std::vector<std::vector<Point>>> & convex_pieces,
-            const unsigned int depth) -> bool
-    {
-      if (side_points.size() < 4 || depth > 32)
-        return false;
-
-      auto trial_mesh = buildReplicatedMesh(3);
-
-      if (isConvexPolyhedron3D(side_points) && tryAddPolyhedron(*trial_mesh, side_points))
-      {
-        convex_pieces.push_back(side_points);
-        return true;
-      }
-
-      std::vector<std::vector<Point>> positive_side_points;
-      std::vector<std::vector<Point>> negative_side_points;
-
-      if (!splitConcaveEdgePolyhedron(
-              side_points, body_centroid_points, positive_side_points, negative_side_points))
-        return false;
-
-      const auto childBodyCentroids = [&](const std::vector<std::vector<Point>> & child_side_points)
-      {
-        std::vector<Point> child_points;
-        std::vector<Point> child_body_centroids;
-
-        for (const auto & side : child_side_points)
-          for (const auto & point : side)
-            addUniquePoint(child_points, point);
-
-        for (const auto & body_centroid_point : body_centroid_points)
-          for (const auto & child_point : child_points)
-            if (MooseUtils::absoluteFuzzyEqual(body_centroid_point, child_point))
-            {
-              addUniquePoint(child_body_centroids, body_centroid_point);
-              break;
-            }
-
-        return child_body_centroids;
-      };
-
-      std::vector<std::vector<std::vector<Point>>> positive_convex_pieces;
-      std::vector<std::vector<std::vector<Point>>> negative_convex_pieces;
-
-      if (!self(self,
-                positive_side_points,
-                childBodyCentroids(positive_side_points),
-                positive_convex_pieces,
-                depth + 1) ||
-          !self(self,
-                negative_side_points,
-                childBodyCentroids(negative_side_points),
-                negative_convex_pieces,
-                depth + 1))
-        return false;
-
-      convex_pieces.insert(
-          convex_pieces.end(), positive_convex_pieces.begin(), positive_convex_pieces.end());
-      convex_pieces.insert(
-          convex_pieces.end(), negative_convex_pieces.begin(), negative_convex_pieces.end());
-
-      return true;
-    };
-
-    const auto addPolyhedronOrSplit = [&](const std::vector<std::vector<Point>> & side_points,
-                                          const std::vector<Point> & body_centroid_points)
-    {
-      std::vector<std::vector<std::vector<Point>>> convex_pieces;
-
-      if (!collectConvexSplitPolyhedra(
-              collectConvexSplitPolyhedra, side_points, body_centroid_points, convex_pieces, 0))
-      {
-        if (addTetrahedralizedPolyhedron(side_points, body_centroid_points))
-          return true;
-
-        return false;
-      }
-
-      for (const auto & convex_piece : convex_pieces)
-      {
-        if (!addPolyhedron(convex_piece))
-        {
-          if (addTetrahedralizedPolyhedron(convex_piece, body_centroid_points))
-            continue;
-
-          return false;
+          dualMesh->add_elem(std::move(tet));
         }
       }
 
       return true;
     };
 
-    // Build one dual polyhedron around each primal node using primal element body centroids,
-    // exterior face centroids, primal boundary edge midpoints, and primal boundary vertices.
+    const auto addPolyhedronOrTetrahedralize =
+        [&](const std::vector<std::vector<Point>> & side_points)
+    {
+      if (addPolyhedron(side_points))
+        return;
+
+      if (!addTetrahedralizedPolyhedron(side_points))
+        mooseError("Could not tetrahedralize rejected non-convex 3D dual polyhedron.");
+    };
+
+    // Build one dual cell around each primal node. Concave cells are broken into TET4s using
+    // checked interior points.
     for (const auto & node_elems : source_node_to_elems)
     {
       const dof_id_type source_node_id = node_elems.first;
@@ -1540,14 +820,12 @@ DualMeshGenerator::generate()
       std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>> edge_to_points;
       std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>>
           midpoint_boundary_face_centroids;
-      std::vector<Point> body_centroid_points;
       std::vector<Point> boundary_face_centroids;
       Point boundary_normal;
 
       for (const auto & elem : node_elems.second)
       {
         const Point elem_centroid = elem->true_centroid();
-        addUniquePoint(body_centroid_points, elem_centroid);
 
         for (const auto side : elem->side_index_range())
         {
@@ -1585,7 +863,7 @@ DualMeshGenerator::generate()
 
           addUniquePoint(previous_edge_points, elem_centroid);
           addUniquePoint(next_edge_points, elem_centroid);
-          // For boundary elements, need to decide splitting/tetrahedralizing
+
           if (elem->neighbor_ptr(side) == nullptr)
           {
             addUniquePoint(previous_edge_points, face_centroid);
@@ -1705,7 +983,7 @@ DualMeshGenerator::generate()
       if (polyhedron_side_points.size() < 4)
         continue;
 
-      addPolyhedronOrSplit(polyhedron_side_points, body_centroid_points);
+      addPolyhedronOrTetrahedralize(polyhedron_side_points);
     }
 
     dualMesh->unset_is_prepared();
