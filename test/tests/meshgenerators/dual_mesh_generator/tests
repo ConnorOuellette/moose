@@ -1,15 +1,25 @@
 [Tests]
   design = 'meshgenerators/DualMeshGenerator.md'
   issues = '#33143'
-  [dual_mesh_generator_2d]
+  [dual_mesh_generator_2d_barycentric]
     type = 'Exodiff'
-    input = 'dual_mesh_generator_2d.i'
+    input = 'dual_mesh_generator_2d_barycentric.i'
     cli_args = '--mesh-only'
-    exodiff = 'dual_mesh_generator_2d_in.e'
+    exodiff = 'dual_mesh_generator_2d_barycentric_in.e'
     mesh_mode = 'REPLICATED'
     recover = false
 
-    requirement = 'The system shall have the capability to generate a dual mesh from a 2D primal mesh while maintaining primal boundary geometry.'
+    requirement = 'The system shall have the capability to generate a barycentric dual mesh from a 2D primal mesh.'
+  []
+  [dual_mesh_generator_2d_voronoi]
+    type = 'Exodiff'
+    input = 'dual_mesh_generator_2d_voronoi.i'
+    cli_args = '--mesh-only'
+    exodiff = 'dual_mesh_generator_2d_voronoi_in.e'
+    mesh_mode = 'REPLICATED'
+    recover = false
+
+    requirement = 'The system shall have the capability to generate a voronoi dual mesh from a 2D primal mesh.'
   []
   [dual_mesh_generator_3d]
     type = 'Exodiff'
@@ -19,11 +29,11 @@
     mesh_mode = 'REPLICATED'
     recover = false
 
-    requirement = 'The system shall have the capability to generate a barycentric dual mesh from a 3D primal mesh while maintaining primal boundary geometry.'
+    requirement = 'The system shall have the capability to generate a barycentric dual mesh from a 3D primal mesh.'
   []
 []
 [error_paths]
-  requirement = 'The system shall report an error when DualMeshGenerator receives'
+  requirement = 'The system shall report an error when attempting to generate a dual mesh'
   [unsupported_dimension]
     type = 'RunException'
     input = 'dual_mesh_generator_unsupported_dimension.i'
@@ -42,5 +52,4 @@
     expect_err = 'DualMeshGenerator does not support Voronoi duals for 3D meshes'
     detail = 'an unsupported combination of dimension and mesh type'
   []
-
 []

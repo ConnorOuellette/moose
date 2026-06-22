@@ -1,11 +1,13 @@
 # DualMeshGenerator
 
-The dual mesh generator creates a dual of a primal mesh. Each node of the dual mesh is positioned at either the circumcenter(s) of a primal element for a Voronoi dual, or the centroid of a primal element for a Barycentric dual. 
+The Dual Mesh Generator creates either a Voronoi or barycentric dual of an input "primal" mesh.
 
-For a Voronoi dual, the primal mesh is first circumscribed within a large square, before being Delaunay triangulated using a poly2Tri_Triangulator. Circumcenters are then calculated, and the dual is then trimmed back to match the primal mesh boundary. For Barycentric duals, the dual mesh is calculated directly, then it is extended to match the boundary. 
+For a barycentric dual, dual nodes are placed at the centroids of each primal element. Around the boundary, primal vertices and midpoints between primal vertices are identified and added to the dual mesh as dual nodes to preserve boundary geometry. For concave boundaries in 2D, dual elements are created as triangles, fanning out from the concave vertex. In 3D, concave boundary elements have an interior node added, from which they are tetrahedralized.
 
-!alert node
-This mesh generator currently only supports 2D input.
+For a Voronoi dual, the primal mesh is first circumscribed within a mesh-scaled square, before being Delaunay triangulated using poly2Tri_Triangulator. Circumcenters of the Delaunay triangles are then calculated and added as dual nodes, and then the mesh is clipped back to match the primal mesh boundary.
+
+!alert note
+This mesh generator does not support taking Voronoi duals of 3D meshes.
 
 !syntax parameters /Mesh/DualMeshGenerator
 

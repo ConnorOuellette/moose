@@ -2,10 +2,9 @@
     [myCCMG]
         type = ConcentricCircleMeshGenerator
         num_sectors = 4
-        radii = '2'
-        rings = '2 1'
-        pitch = 5
-        has_outer_square = true
+        radii = '2 4'
+        rings = '2 2'
+        has_outer_square = false
         preserve_volumes = false
     []
 
@@ -22,14 +21,29 @@
         block = 10
     []
 
+    [extrude]
+        type = AdvancedExtruderGenerator
+        input = cut_center
+        direction = '0 0 1'
+        heights = '5'
+        num_layers = '3'
+    []
+
     [myDualGen]
         type = DualMeshGenerator
-        input = cut_center
+        input = extrude
         dual_mesh_type = barycentric
+    []
+
+    [check]
+        type = MeshDiagnosticsGenerator
+        input = myDualGen
+        examine_element_volumes = WARNING
+        examine_element_overlap = WARNING
     []
 
     [convert]
         type = ElementsToSimplicesConverter
-        input = myDualGen
+        input = check
     []
 []

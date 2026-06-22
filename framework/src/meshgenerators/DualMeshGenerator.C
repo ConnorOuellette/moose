@@ -10,7 +10,7 @@
 #include "DualMeshGenerator.h"
 #include "Conversion.h"
 #include "CastUniquePointer.h"
-#include "MooseMeshUtils.h"
+#include "MooseUtils.h"
 #include "libmesh/cell_c0polyhedron.h"
 #include "libmesh/cell_tet4.h"
 #include "libmesh/face_c0polygon.h"
@@ -26,6 +26,11 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 registerMooseObject("MooseApp", DualMeshGenerator);
 
@@ -36,10 +41,10 @@ DualMeshGenerator::validParams()
 
   params.addRequiredParam<MeshGeneratorName>("input", "The mesh we want to modify");
   MooseEnum dual_mesh_type("voronoi barycentric", "barycentric");
-  params.addParam<MooseEnum>(
-      "dual_mesh_type",
-      dual_mesh_type,
-      "Whether to place dual nodes at Delaunay circumcenters or primal element centroids.");
+  params.addParam<MooseEnum>("dual_mesh_type",
+                             dual_mesh_type,
+                             "Whether to output a barycentric dual or a Voronoi dual of the "
+                             "Delaunay triangulation of the primal mesh.");
   params.addRangeCheckedParam<Real>(
       "boundary_node_angular_tol",
       1e-8,
@@ -62,9 +67,9 @@ DualMeshGenerator::validParams()
 DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
   : MeshGenerator(parameters),
     _input(getMesh("input")),
+    _dual_mesh_type(getParam<MooseEnum>("dual_mesh_type")),
     _boundary_node_angular_tol(getParam<Real>("boundary_node_angular_tol")),
-    _geometry_relative_tol(getParam<Real>("geometry_relative_tol")),
-    _dual_mesh_type(getParam<MooseEnum>("dual_mesh_type"))
+    _geometry_relative_tol(getParam<Real>("geometry_relative_tol"))
 {
 }
 
@@ -74,31 +79,30 @@ elementsShareTwoNodes(const Elem * a, const Elem * b)
 {
   unsigned int shared_nodes = 0;
 
-  for (unsigned int i = 0; i < a->n_nodes(); ++i)
-    for (unsigned int j = 0; j < b->n_nodes(); ++j)
+  for (const auto i : a->node_index_range())
+    for (const auto j : b->node_index_range())
       if (a->node_id(i) == b->node_id(j))
         ++shared_nodes;
+
+  mooseAssert(
+      (shared_nodes < 3),
+      "Detected elements sharing > 3 nodes."); // This is typically a sign of intertwined elements
 
   return shared_nodes == 2;
 }
 
+// Cross product, used for colinearity, segment tests, and concavity tests
 static Real
 cross2D(const Point & a, const Point & b, const Point & c)
 {
   return (b(0) - a(0)) * (c(1) - a(1)) - (b(1) - a(1)) * (c(0) - a(0));
 }
 
-static bool
-samePoint(const Point & a, const Point & b, const Real length_tol = 1e-12)
-{
-  return (a - b).norm() <= length_tol;
-}
-
 static void
 addUniquePoint(std::vector<Point> & points, const Point & point, const Real length_tol = 1e-12)
 {
   for (const auto & existing_point : points)
-    if (samePoint(existing_point, point, length_tol))
+    if (MooseUtils::absoluteFuzzyEqual(existing_point, point, length_tol))
       return;
 
   points.push_back(point);
@@ -120,6 +124,8 @@ pointOnSegment2D(const Point & point,
           point(1) <= std::max(a(1), b(1)) + length_tol);
 }
 
+// We use intersections when we clip a mesh back to the primal boundary. Those intersection points
+// are necessary to keep the elements being reasonable within the boundary
 static void
 addSegmentIntersections2D(std::vector<Point> & points,
                           const Point & p0,
@@ -160,6 +166,7 @@ addSegmentIntersections2D(std::vector<Point> & points,
     addUniquePoint(points, p0 + t * r, length_tol);
 }
 
+// Ray casting test to see if points are inside a polygon
 static bool
 pointInPolygon2D(const Point & point,
                  const std::vector<Point> & polygon,
@@ -171,8 +178,9 @@ pointInPolygon2D(const Point & point,
 
   bool inside = false;
 
-  for (std::size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++)
+  for (const auto i : index_range(polygon))
   {
+    const auto j = (i + polygon.size() - 1) % polygon.size();
     const Point & pi = polygon[i];
     const Point & pj = polygon[j];
 
@@ -195,8 +203,11 @@ polygonSignedArea2D(const std::vector<Point> & polygon)
 
   Real area = 0.0;
 
-  for (std::size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++)
+  for (const auto i : index_range(polygon))
+  {
+    const auto j = (i + polygon.size() - 1) % polygon.size();
     area += polygon[j](0) * polygon[i](1) - polygon[i](0) * polygon[j](1);
+  }
 
   return 0.5 * area;
 }
@@ -209,24 +220,27 @@ struct BoundarySegment
   Point p1;
 };
 
+// Helps maps treat an edge the same regardless of direction
 static std::pair<dof_id_type, dof_id_type>
 edgeKey(const dof_id_type node0, const dof_id_type node1)
 {
   return {std::min(node0, node1), std::max(node0, node1)};
 }
 
+// Used to reject degenerate polygon faces
 static bool
 hasNonzeroArea3D(const std::vector<Point> & points, const Real tol = 1e-12)
 {
-  for (std::size_t i = 0; i < points.size(); ++i)
-    for (std::size_t j = i + 1; j < points.size(); ++j)
-      for (std::size_t k = j + 1; k < points.size(); ++k)
+  for (const auto i : index_range(points))
+    for (const auto j : make_range(i + 1, points.size()))
+      for (const auto k : make_range(j + 1, points.size()))
         if (((points[j] - points[i]).cross(points[k] - points[i])).norm() > tol)
           return true;
 
   return false;
 }
 
+// For adding polygon faces to polyhedrons
 static void
 addSidePoints3D(std::vector<std::vector<Point>> & sides,
                 const std::vector<Point> & side_points,
@@ -243,12 +257,13 @@ addSidePoints3D(std::vector<std::vector<Point>> & sides,
   sides.push_back(unique_side_points);
 }
 
+// For finding a normal of the first non-collinear triple in a face's points
 static Point
 faceNormal3D(const std::vector<Point> & points, const Real tol = 1e-12)
 {
-  for (std::size_t i = 0; i < points.size(); ++i)
-    for (std::size_t j = i + 1; j < points.size(); ++j)
-      for (std::size_t k = j + 1; k < points.size(); ++k)
+  for (const auto i : index_range(points))
+    for (const auto j : make_range(i + 1, points.size()))
+      for (const auto k : make_range(j + 1, points.size()))
       {
         const Point normal = (points[j] - points[i]).cross(points[k] - points[i]);
 
@@ -259,31 +274,21 @@ faceNormal3D(const std::vector<Point> & points, const Real tol = 1e-12)
   return Point();
 }
 
+// Computes six times the tetrahedron volume
 static Real
 tetVolume6(const Point & a, const Point & b, const Point & c, const Point & d)
 {
   return (b - a).cross(c - a) * (d - a);
 }
 
-static Real
-meshVolume(const MeshBase & mesh)
-{
-  Real volume = 0.0;
-
-  for (const auto & elem : mesh.active_element_ptr_range())
-    volume += elem->volume();
-
-  return volume;
-}
-
-static bool
-findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
-                  const std::vector<Point> & unique_points,
-                  std::pair<unsigned int, unsigned int> & concave_edge,
-                  const Real tol = 1e-12)
+// Detects concave edges on 3D polyhedrons, avoiding C0Polyhedron mooseErrors for concave polyhedra
+static std::vector<std::pair<unsigned int, unsigned int>>
+findConcaveEdges3D(const std::vector<std::vector<Point>> & side_points,
+                   const std::vector<Point> & unique_points,
+                   const Real tol = 1e-12)
 {
   if (side_points.size() < 4 || unique_points.size() < 4)
-    return false;
+    return {};
 
   Point polyhedron_center;
 
@@ -295,7 +300,7 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
   const auto pointIndex = [&](const Point & point, unsigned int & index) -> bool
   {
     for (const auto i : make_range(unique_points.size()))
-      if (samePoint(unique_points[i], point))
+      if (MooseUtils::absoluteFuzzyEqual(unique_points[i], point))
       {
         index = cast_int<unsigned int>(i);
         return true;
@@ -314,7 +319,7 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
     face_centers[side_i] /= side_points[side_i].size();
 
     if (faceNormal3D(side_points[side_i], tol).norm() <= tol)
-      return false;
+      return {};
   }
 
   std::map<std::pair<unsigned int, unsigned int>, std::vector<unsigned int>> edge_to_sides;
@@ -327,13 +332,12 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
 
       if (!pointIndex(side_points[side_i][point_i], p0) ||
           !pointIndex(side_points[side_i][(point_i + 1) % side_points[side_i].size()], p1))
-        return false;
+        return {};
 
       edge_to_sides[{std::min(p0, p1), std::max(p0, p1)}].push_back(cast_int<unsigned int>(side_i));
     }
 
-  bool found_concave_edge = false;
-  Real best_concave_score = 0.0;
+  std::vector<std::pair<Real, std::pair<unsigned int, unsigned int>>> scored_concave_edges;
 
   for (const auto & edge_sides : edge_to_sides)
   {
@@ -397,7 +401,8 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
 
     for (const auto & point : unique_points)
     {
-      if (samePoint(point, edge_point0) || samePoint(point, edge_point1))
+      if (MooseUtils::absoluteFuzzyEqual(point, edge_point0) ||
+          MooseUtils::absoluteFuzzyEqual(point, edge_point1))
         continue;
 
       const Point direction = edgeRadialDirection(point);
@@ -420,15 +425,19 @@ findConcaveEdge3D(const std::vector<std::vector<Point>> & side_points,
     const Real concave_score = (center_outside ? 1000.0 : 0.0) + static_cast<Real>(outside_count) -
                                static_cast<Real>(inside_count);
 
-    if (concave_score > best_concave_score)
-    {
-      found_concave_edge = true;
-      best_concave_score = concave_score;
-      concave_edge = edge_sides.first;
-    }
+    scored_concave_edges.push_back({concave_score, edge_sides.first});
   }
 
-  return found_concave_edge;
+  std::sort(scored_concave_edges.begin(),
+            scored_concave_edges.end(),
+            [](const auto & a, const auto & b) { return a.first > b.first; });
+
+  std::vector<std::pair<unsigned int, unsigned int>> concave_edges;
+
+  for (const auto & scored_edge : scored_concave_edges)
+    concave_edges.push_back(scored_edge.second);
+
+  return concave_edges;
 }
 
 static bool
@@ -497,6 +506,7 @@ addUniqueDirection3D(std::vector<Point> & directions,
   directions.push_back(unit_direction);
 }
 
+// Sorting, but 3D
 static std::vector<Point>
 sortPointsAroundAxis3D(const std::vector<Point> & unsorted_points,
                        const Point & axis,
@@ -555,6 +565,134 @@ sortPointsAroundAxis3D(const std::vector<Point> & unsorted_points,
   return points;
 }
 
+static bool
+pointInTriangle3D(const Point & point,
+                  const Point & triangle_point0,
+                  const Point & triangle_point1,
+                  const Point & triangle_point2,
+                  const Point & normal,
+                  const Real tol = 1e-12)
+{
+  if (normal.norm() <= tol)
+    return false;
+
+  const Point unit_normal = normal / normal.norm();
+  const Real edge_scale = std::max(std::max((triangle_point1 - triangle_point0).norm(),
+                                            (triangle_point2 - triangle_point1).norm()),
+                                   std::max((triangle_point0 - triangle_point2).norm(), Real(1.0)));
+  const Real area_tol = tol * edge_scale * edge_scale;
+
+  const Real signed_area0 =
+      unit_normal * ((triangle_point1 - triangle_point0).cross(point - triangle_point0));
+  const Real signed_area1 =
+      unit_normal * ((triangle_point2 - triangle_point1).cross(point - triangle_point1));
+  const Real signed_area2 =
+      unit_normal * ((triangle_point0 - triangle_point2).cross(point - triangle_point2));
+
+  return signed_area0 > area_tol && signed_area1 > area_tol && signed_area2 > area_tol;
+}
+
+static bool
+triangulatePolygon3D(const std::vector<Point> & polygon_points,
+                     std::vector<std::vector<Point>> & triangles,
+                     const Real tol = 1e-12)
+{
+  if (polygon_points.size() < 3)
+    return false;
+
+  if (polygon_points.size() == 3)
+  {
+    if (hasNonzeroArea3D(polygon_points, tol))
+      triangles.push_back(polygon_points);
+
+    return true;
+  }
+
+  Point normal = faceNormal3D(polygon_points, tol);
+
+  if (normal.norm() <= tol)
+    return false;
+
+  normal /= normal.norm();
+
+  Real edge_scale = 1.0;
+
+  for (const auto i : index_range(polygon_points))
+    edge_scale = std::max(
+        edge_scale, (polygon_points[(i + 1) % polygon_points.size()] - polygon_points[i]).norm());
+
+  const Real area_tol = tol * edge_scale * edge_scale;
+  std::vector<std::size_t> remaining_points;
+  remaining_points.reserve(polygon_points.size());
+
+  for (const auto i : index_range(polygon_points))
+    remaining_points.push_back(i);
+
+  while (remaining_points.size() > 3)
+  {
+    bool clipped_ear = false;
+
+    for (const auto i : index_range(remaining_points))
+    {
+      const auto previous_i = (i + remaining_points.size() - 1) % remaining_points.size();
+      const auto next_i = (i + 1) % remaining_points.size();
+      const Point & previous_point = polygon_points[remaining_points[previous_i]];
+      const Point & current_point = polygon_points[remaining_points[i]];
+      const Point & next_point = polygon_points[remaining_points[next_i]];
+
+      const Real corner_area =
+          normal * ((current_point - previous_point).cross(next_point - previous_point));
+
+      if (corner_area <= area_tol)
+        continue;
+
+      bool contains_other_point = false;
+
+      for (const auto candidate_i : index_range(remaining_points))
+      {
+        if (candidate_i == previous_i || candidate_i == i || candidate_i == next_i)
+          continue;
+
+        if (pointInTriangle3D(polygon_points[remaining_points[candidate_i]],
+                              previous_point,
+                              current_point,
+                              next_point,
+                              normal,
+                              tol))
+        {
+          contains_other_point = true;
+          break;
+        }
+      }
+
+      if (contains_other_point)
+        continue;
+
+      const std::vector<Point> triangle_points = {previous_point, current_point, next_point};
+
+      if (hasNonzeroArea3D(triangle_points, tol))
+        triangles.push_back(triangle_points);
+
+      remaining_points.erase(remaining_points.begin() + i);
+      clipped_ear = true;
+      break;
+    }
+
+    if (!clipped_ear)
+      return false;
+  }
+
+  const std::vector<Point> triangle_points = {polygon_points[remaining_points[0]],
+                                              polygon_points[remaining_points[1]],
+                                              polygon_points[remaining_points[2]]};
+
+  if (hasNonzeroArea3D(triangle_points, tol))
+    triangles.push_back(triangle_points);
+
+  return true;
+}
+
+// Triangulates troublesome polyhedrons to avoid C0Polyhedron error
 static void
 addTriangulatedSidePoints3D(std::vector<std::vector<Point>> & sides,
                             const std::vector<Point> & side_points,
@@ -579,20 +717,22 @@ addTriangulatedSidePoints3D(std::vector<std::vector<Point>> & sides,
     return;
   }
 
-  for (std::size_t i = 1; i + 1 < sorted_side_points.size(); ++i)
-  {
-    const std::vector<Point> triangle_points = {
-        sorted_side_points[0], sorted_side_points[i], sorted_side_points[i + 1]};
+  std::vector<std::vector<Point>> triangle_points;
 
-    if (hasNonzeroArea3D(triangle_points, tol))
-      sides.push_back(triangle_points);
-  }
+  if (!triangulatePolygon3D(sorted_side_points, triangle_points, tol))
+    return;
+
+  for (const auto & triangle : triangle_points)
+    sides.push_back(triangle);
 }
 
 std::unique_ptr<MeshBase>
 DualMeshGenerator::generate()
 {
   const auto input_mesh = std::move(_input);
+
+  if (!input_mesh->is_prepared())
+    input_mesh->find_neighbors();
 
   const bool use_voronoi = _dual_mesh_type == "voronoi";
   const unsigned int mesh_dimension = input_mesh->mesh_dimension();
@@ -603,8 +743,6 @@ DualMeshGenerator::generate()
     mooseError("DualMeshGenerator does not support Voronoi duals for 3D meshes");
   if (mesh_dimension == 3)
   {
-    _console << "DualMeshGenerator 3D input mesh volume: " << meshVolume(*input_mesh) << "\n";
-
     auto dualMesh = buildReplicatedMesh(3);
 
     std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_normals;
@@ -673,15 +811,6 @@ DualMeshGenerator::generate()
       for (const auto n : make_range(elem->n_vertices()))
         source_node_to_elems[elem->node_id(n)].push_back(elem);
 
-    std::size_t split_nonconvex_polyhedron_count = 0;
-    std::size_t tetrahedralized_nonconvex_polyhedron_count = 0;
-    std::size_t skipped_nonconvex_polyhedron_count = 0;
-    std::size_t tetrahedralized_added_tet_count = 0;
-    std::size_t tetrahedralized_flat_triangle_count = 0;
-    std::size_t tetrahedralized_concave_half_plane_triangle_count = 0;
-    Real tetrahedralized_candidate_volume = 0.0;
-    Real tetrahedralized_accepted_volume = 0.0;
-
     const auto tryAddPolyhedron =
         [&](MeshBase & mesh, const std::vector<std::vector<Point>> & polyhedron_side_points) -> bool
     {
@@ -694,7 +823,7 @@ DualMeshGenerator::generate()
       const auto getLocalNode = [&](const Point & point)
       {
         for (auto * const node : local_nodes)
-          if (samePoint(*node, point))
+          if (MooseUtils::absoluteFuzzyEqual(*node, point))
             return node;
 
         Node * const node = mesh.add_point(point);
@@ -744,7 +873,8 @@ DualMeshGenerator::generate()
 
       return tryAddPolyhedron(*dualMesh, polyhedron_side_points);
     };
-
+    // If all else fails, we'll have to add an interior point, since not all polyhedrons are
+    // tetrahedralizable with vertex preservation
     const auto addTetrahedralizedPolyhedron =
         [&](const std::vector<std::vector<Point>> & side_points,
             const std::vector<Point> & body_centroid_points) -> bool
@@ -768,7 +898,7 @@ DualMeshGenerator::generate()
 
       for (const auto & body_centroid_point : body_centroid_points)
         for (const auto & point : unique_points)
-          if (samePoint(body_centroid_point, point))
+          if (MooseUtils::absoluteFuzzyEqual(body_centroid_point, point))
           {
             addUniquePoint(interior_point_candidates, point);
             break;
@@ -782,39 +912,45 @@ DualMeshGenerator::generate()
 
       interior_point /= point_source.size();
 
-      bool guard_concave_half_plane = false;
-      Point concave_plane_normal;
-      Point concave_half_plane_direction;
-      Point concave_edge_midpoint;
-      Real concave_half_plane_distance = 0.0;
-      std::pair<unsigned int, unsigned int> concave_edge;
-
-      if (findConcaveEdge3D(side_points, unique_points, concave_edge))
+      struct ConcaveHalfPlaneGuard
       {
-        const Point edge_point0 = unique_points[concave_edge.first];
-        const Point edge_point1 = unique_points[concave_edge.second];
+        Point plane_normal;
+        Point half_plane_direction;
+        Point edge_midpoint;
+        Real half_plane_distance;
+      };
+
+      std::vector<ConcaveHalfPlaneGuard> concave_half_plane_guards;
+
+      for (const auto & concave_edge : findConcaveEdges3D(side_points, unique_points))
+      {
+        const Point & edge_point0 = unique_points[concave_edge.first];
+        const Point & edge_point1 = unique_points[concave_edge.second];
         const Point concave_edge_vector = edge_point1 - edge_point0;
+
+        if (concave_edge_vector.norm() <= 1e-12)
+          continue;
+
         const Point concave_edge_axis = concave_edge_vector / concave_edge_vector.norm();
-        concave_edge_midpoint = 0.5 * (edge_point0 + edge_point1);
-        concave_half_plane_direction = interior_point - concave_edge_midpoint;
+        const Point concave_edge_midpoint = 0.5 * (edge_point0 + edge_point1);
+        Point concave_half_plane_direction = interior_point - concave_edge_midpoint;
         concave_half_plane_direction -=
             (concave_half_plane_direction * concave_edge_axis) * concave_edge_axis;
-        concave_half_plane_distance = concave_half_plane_direction.norm();
-        concave_plane_normal = concave_edge_vector.cross(interior_point - edge_point0);
+        const Real concave_half_plane_distance = concave_half_plane_direction.norm();
+        Point concave_plane_normal = concave_edge_vector.cross(interior_point - edge_point0);
 
         if (concave_plane_normal.norm() > 1e-12 && concave_half_plane_distance > 1e-12)
         {
           concave_plane_normal /= concave_plane_normal.norm();
           concave_half_plane_direction /= concave_half_plane_distance;
-          guard_concave_half_plane = true;
+          concave_half_plane_guards.push_back({concave_plane_normal,
+                                               concave_half_plane_direction,
+                                               concave_edge_midpoint,
+                                               concave_half_plane_distance});
         }
       }
 
       std::vector<std::array<Point, 4>> tets;
-      std::size_t flat_triangle_count = 0;
-      std::size_t concave_half_plane_triangle_count = 0;
-      Real candidate_volume = 0.0;
-      Real accepted_volume = 0.0;
 
       const auto addTetFromTriangle = [&](const std::vector<Point> & triangle_points)
       {
@@ -826,8 +962,6 @@ DualMeshGenerator::generate()
 
         if (std::abs(split_volume6) <= 1e-12)
           return;
-
-        accepted_volume += std::abs(split_volume6) / 6.0;
 
         if (split_volume6 > 0.0)
           tets.push_back(
@@ -842,8 +976,107 @@ DualMeshGenerator::generate()
         if (polygon_points.size() < 3)
           return;
 
-        for (std::size_t i = 1; i + 1 < polygon_points.size(); ++i)
+        for (const auto i : make_range(std::size_t(1), polygon_points.size() - 1))
           addTetFromTriangle({polygon_points[0], polygon_points[i], polygon_points[i + 1]});
+      };
+
+      const auto splitPolygonByConcaveHalfPlane =
+          [&](const std::vector<Point> & polygon,
+              const ConcaveHalfPlaneGuard & guard,
+              std::vector<std::vector<Point>> & split_polygons)
+      {
+        if (polygon.size() < 3)
+          return;
+
+        std::vector<Real> signed_distances(polygon.size());
+        unsigned int positive_count = 0;
+        unsigned int negative_count = 0;
+
+        for (const auto i : index_range(polygon))
+        {
+          signed_distances[i] = guard.plane_normal * (polygon[i] - interior_point);
+
+          if (signed_distances[i] > 1e-10)
+            ++positive_count;
+          else if (signed_distances[i] < -1e-10)
+            ++negative_count;
+        }
+
+        bool split_for_concave_half_plane = false;
+
+        if (positive_count > 0 && negative_count > 0)
+        {
+          for (const auto i : index_range(polygon))
+          {
+            const auto j = (i + 1) % polygon.size();
+            const Real signed_distance0 = signed_distances[i];
+            const Real signed_distance1 = signed_distances[j];
+
+            if (signed_distance0 > 1e-10 && signed_distance1 > 1e-10)
+              continue;
+            if (signed_distance0 < -1e-10 && signed_distance1 < -1e-10)
+              continue;
+
+            const Real denominator = signed_distance0 - signed_distance1;
+
+            if (std::abs(denominator) <= 1e-12)
+              continue;
+
+            const Real t = signed_distance0 / denominator;
+
+            if (t < -1e-10 || t > 1.0 + 1e-10)
+              continue;
+
+            const Point intersection = polygon[i] + t * (polygon[j] - polygon[i]);
+            const Real half_plane_distance =
+                (intersection - guard.edge_midpoint) * guard.half_plane_direction;
+
+            if (half_plane_distance >= -1e-10 &&
+                half_plane_distance <= guard.half_plane_distance + 1e-10)
+            {
+              split_for_concave_half_plane = true;
+              break;
+            }
+          }
+        }
+
+        if (!split_for_concave_half_plane)
+        {
+          split_polygons.push_back(polygon);
+          return;
+        }
+
+        std::vector<Point> positive_polygon;
+        std::vector<Point> negative_polygon;
+
+        for (const auto i : index_range(polygon))
+        {
+          const auto j = (i + 1) % polygon.size();
+          const Point & point0 = polygon[i];
+          const Point & point1 = polygon[j];
+          const Real signed_distance0 = signed_distances[i];
+          const Real signed_distance1 = signed_distances[j];
+
+          if (signed_distance0 >= -1e-10)
+            addUniquePoint(positive_polygon, point0);
+          if (signed_distance0 <= 1e-10)
+            addUniquePoint(negative_polygon, point0);
+
+          if ((signed_distance0 > 1e-10 && signed_distance1 < -1e-10) ||
+              (signed_distance0 < -1e-10 && signed_distance1 > 1e-10))
+          {
+            const Real t = signed_distance0 / (signed_distance0 - signed_distance1);
+            const Point intersection = point0 + t * (point1 - point0);
+
+            addUniquePoint(positive_polygon, intersection);
+            addUniquePoint(negative_polygon, intersection);
+          }
+        }
+
+        if (positive_polygon.size() >= 3)
+          split_polygons.push_back(positive_polygon);
+        if (negative_polygon.size() >= 3)
+          split_polygons.push_back(negative_polygon);
       };
 
       for (const auto & triangle : surface_triangles)
@@ -851,121 +1084,34 @@ DualMeshGenerator::generate()
         const Real volume6 = tetVolume6(interior_point, triangle[0], triangle[1], triangle[2]);
 
         if (std::abs(volume6) <= 1e-12)
-        {
-          ++flat_triangle_count;
           continue;
-        }
 
-        candidate_volume += std::abs(volume6) / 6.0;
+        std::vector<std::vector<Point>> clipped_polygons = {
+            {triangle[0], triangle[1], triangle[2]}};
 
-        bool split_for_concave_half_plane = false;
-        std::array<Real, 3> signed_distances;
-
-        if (guard_concave_half_plane)
+        for (const auto & guard : concave_half_plane_guards)
         {
-          unsigned int positive_count = 0;
-          unsigned int negative_count = 0;
+          std::vector<std::vector<Point>> next_clipped_polygons;
 
-          for (const auto i : make_range(triangle.size()))
-          {
-            signed_distances[i] = concave_plane_normal * (triangle[i] - interior_point);
+          for (const auto & clipped_polygon : clipped_polygons)
+            splitPolygonByConcaveHalfPlane(clipped_polygon, guard, next_clipped_polygons);
 
-            if (signed_distances[i] > 1e-10)
-              ++positive_count;
-            else if (signed_distances[i] < -1e-10)
-              ++negative_count;
-          }
-
-          if (positive_count > 0 && negative_count > 0)
-          {
-            for (const auto i : make_range(triangle.size()))
-            {
-              const auto j = (i + 1) % triangle.size();
-              const Real signed_distance0 = signed_distances[i];
-              const Real signed_distance1 = signed_distances[j];
-
-              if (signed_distance0 > 1e-10 && signed_distance1 > 1e-10)
-                continue;
-              if (signed_distance0 < -1e-10 && signed_distance1 < -1e-10)
-                continue;
-
-              const Real denominator = signed_distance0 - signed_distance1;
-
-              if (std::abs(denominator) <= 1e-12)
-                continue;
-
-              const Real t = signed_distance0 / denominator;
-
-              if (t < -1e-10 || t > 1.0 + 1e-10)
-                continue;
-
-              const Point intersection = triangle[i] + t * (triangle[j] - triangle[i]);
-              const Real half_plane_distance =
-                  (intersection - concave_edge_midpoint) * concave_half_plane_direction;
-
-              if (half_plane_distance >= -1e-10 &&
-                  half_plane_distance <= concave_half_plane_distance + 1e-10)
-              {
-                split_for_concave_half_plane = true;
-                break;
-              }
-            }
-          }
+          clipped_polygons = std::move(next_clipped_polygons);
         }
 
-        if (split_for_concave_half_plane)
-        {
-          std::vector<Point> positive_polygon;
-          std::vector<Point> negative_polygon;
-
-          for (const auto i : make_range(triangle.size()))
-          {
-            const auto j = (i + 1) % triangle.size();
-            const Point & point0 = triangle[i];
-            const Point & point1 = triangle[j];
-            const Real signed_distance0 = signed_distances[i];
-            const Real signed_distance1 = signed_distances[j];
-
-            if (signed_distance0 >= -1e-10)
-              addUniquePoint(positive_polygon, point0);
-            if (signed_distance0 <= 1e-10)
-              addUniquePoint(negative_polygon, point0);
-
-            if ((signed_distance0 > 1e-10 && signed_distance1 < -1e-10) ||
-                (signed_distance0 < -1e-10 && signed_distance1 > 1e-10))
-            {
-              const Real t = signed_distance0 / (signed_distance0 - signed_distance1);
-              const Point intersection = point0 + t * (point1 - point0);
-
-              addUniquePoint(positive_polygon, intersection);
-              addUniquePoint(negative_polygon, intersection);
-            }
-          }
-
-          ++concave_half_plane_triangle_count;
-          addTetFromClippedPolygon(positive_polygon);
-          addTetFromClippedPolygon(negative_polygon);
-          continue;
-        }
-
-        addTetFromTriangle(triangle);
+        for (const auto & clipped_polygon : clipped_polygons)
+          addTetFromClippedPolygon(clipped_polygon);
       }
 
       if (tets.empty())
         return false;
-
-      tetrahedralized_added_tet_count += tets.size();
-      tetrahedralized_flat_triangle_count += flat_triangle_count;
-      tetrahedralized_concave_half_plane_triangle_count += concave_half_plane_triangle_count;
-      tetrahedralized_candidate_volume += candidate_volume;
-      tetrahedralized_accepted_volume += accepted_volume;
 
       std::vector<Node *> local_nodes;
 
       const auto getLocalNode = [&](const Point & point)
       {
         for (auto * const node : local_nodes)
-          if (samePoint(*node, point))
+          if (MooseUtils::absoluteFuzzyEqual(*node, point))
             return node;
 
         Node * const node = dualMesh->add_point(point);
@@ -986,7 +1132,8 @@ DualMeshGenerator::generate()
 
       return true;
     };
-
+    // Default treatment for concave edge polyhedra; if we don't *need* to add an interior point,
+    // let's not.
     const auto splitConcaveEdgePolyhedron =
         [&](const std::vector<std::vector<Point>> & side_points,
             const std::vector<Point> & body_centroid_points,
@@ -1018,10 +1165,10 @@ DualMeshGenerator::generate()
       const auto pointIndex = [&](const Point & point) -> unsigned int
       {
         for (const auto i : make_range(unique_points.size()))
-          if (samePoint(unique_points[i], point))
+          if (MooseUtils::absoluteFuzzyEqual(unique_points[i], point))
             return cast_int<unsigned int>(i);
 
-        mooseError("Could not find point while splitting non-convex 3D dual polyhedron.");
+        mooseAssert(false, "Could not find point while splitting non-convex 3D dual polyhedron.");
         return 0;
       };
 
@@ -1119,7 +1266,8 @@ DualMeshGenerator::generate()
 
         for (const auto & point : unique_points)
         {
-          if (samePoint(point, edge_point0) || samePoint(point, edge_point1))
+          if (MooseUtils::absoluteFuzzyEqual(point, edge_point0) ||
+              MooseUtils::absoluteFuzzyEqual(point, edge_point1))
             continue;
 
           const Point direction = edgeRadialDirection(point);
@@ -1169,8 +1317,9 @@ DualMeshGenerator::generate()
 
       for (const auto & point : body_centroid_points)
         for (const auto & unique_point : unique_points)
-          if (samePoint(point, unique_point) && !samePoint(unique_point, edge_point0) &&
-              !samePoint(unique_point, edge_point1))
+          if (MooseUtils::absoluteFuzzyEqual(point, unique_point) &&
+              !MooseUtils::absoluteFuzzyEqual(unique_point, edge_point0) &&
+              !MooseUtils::absoluteFuzzyEqual(unique_point, edge_point1))
           {
             addUniquePoint(body_points, unique_point);
             break;
@@ -1184,8 +1333,8 @@ DualMeshGenerator::generate()
                 [&distanceToConcaveEdge](const Point & a, const Point & b)
                 { return distanceToConcaveEdge(a) < distanceToConcaveEdge(b); });
 
-      for (std::size_t body_i = 0; body_i < body_points.size(); ++body_i)
-        for (std::size_t body_j = body_i + 1; body_j < body_points.size(); ++body_j)
+      for (const auto body_i : index_range(body_points))
+        for (const auto body_j : make_range(body_i + 1, body_points.size()))
         {
           const Point & body_point0 = body_points[body_i];
           const Point & body_point1 = body_points[body_j];
@@ -1322,7 +1471,7 @@ DualMeshGenerator::generate()
 
         for (const auto & body_centroid_point : body_centroid_points)
           for (const auto & child_point : child_points)
-            if (samePoint(body_centroid_point, child_point))
+            if (MooseUtils::absoluteFuzzyEqual(body_centroid_point, child_point))
             {
               addUniquePoint(child_body_centroids, body_centroid_point);
               break;
@@ -1351,7 +1500,6 @@ DualMeshGenerator::generate()
       convex_pieces.insert(
           convex_pieces.end(), negative_convex_pieces.begin(), negative_convex_pieces.end());
 
-      ++split_nonconvex_polyhedron_count;
       return true;
     };
 
@@ -1364,12 +1512,8 @@ DualMeshGenerator::generate()
               collectConvexSplitPolyhedra, side_points, body_centroid_points, convex_pieces, 0))
       {
         if (addTetrahedralizedPolyhedron(side_points, body_centroid_points))
-        {
-          ++tetrahedralized_nonconvex_polyhedron_count;
           return true;
-        }
 
-        ++skipped_nonconvex_polyhedron_count;
         return false;
       }
 
@@ -1378,12 +1522,8 @@ DualMeshGenerator::generate()
         if (!addPolyhedron(convex_piece))
         {
           if (addTetrahedralizedPolyhedron(convex_piece, body_centroid_points))
-          {
-            ++tetrahedralized_nonconvex_polyhedron_count;
             continue;
-          }
 
-          ++skipped_nonconvex_polyhedron_count;
           return false;
         }
       }
@@ -1391,8 +1531,8 @@ DualMeshGenerator::generate()
       return true;
     };
 
-    // Build one dual polyhedron around each primal node using element centroids, exterior face
-    // centroids, and primal boundary vertices.
+    // Build one dual polyhedron around each primal node using primal element body centroids,
+    // exterior face centroids, primal boundary edge midpoints, and primal boundary vertices.
     for (const auto & node_elems : source_node_to_elems)
     {
       const dof_id_type source_node_id = node_elems.first;
@@ -1419,6 +1559,7 @@ DualMeshGenerator::generate()
           current_side_node_ids.reserve(side_elem->n_vertices());
           current_side_points.reserve(side_elem->n_vertices());
 
+          // For interior dual elements
           for (const auto n : make_range(side_elem->n_vertices()))
           {
             current_side_node_ids.push_back(side_elem->node_id(n));
@@ -1444,7 +1585,7 @@ DualMeshGenerator::generate()
 
           addUniquePoint(previous_edge_points, elem_centroid);
           addUniquePoint(next_edge_points, elem_centroid);
-
+          // For boundary elements, need to decide splitting/tetrahedralizing
           if (elem->neighbor_ptr(side) == nullptr)
           {
             addUniquePoint(previous_edge_points, face_centroid);
@@ -1514,8 +1655,8 @@ DualMeshGenerator::generate()
           addSidePoints3D(polyhedron_side_points,
                           {source_point, midpoint_it->second, face_centroid});
 
-        for (std::size_t i = 0; i < midpoint_face_centroids.second.size(); ++i)
-          for (std::size_t j = i + 1; j < midpoint_face_centroids.second.size(); ++j)
+        for (const auto i : index_range(midpoint_face_centroids.second))
+          for (const auto j : make_range(i + 1, midpoint_face_centroids.second.size()))
             midpoint_split_boundary_faces.push_back(
                 {midpoint_face_centroids.second[i], midpoint_face_centroids.second[j]});
       }
@@ -1529,10 +1670,10 @@ DualMeshGenerator::generate()
         const auto boundaryFaceWasSplit = [&](const Point & point0, const Point & point1)
         {
           for (const auto & split_boundary_face : midpoint_split_boundary_faces)
-            if ((samePoint(point0, split_boundary_face.first) &&
-                 samePoint(point1, split_boundary_face.second)) ||
-                (samePoint(point0, split_boundary_face.second) &&
-                 samePoint(point1, split_boundary_face.first)))
+            if ((MooseUtils::absoluteFuzzyEqual(point0, split_boundary_face.first) &&
+                 MooseUtils::absoluteFuzzyEqual(point1, split_boundary_face.second)) ||
+                (MooseUtils::absoluteFuzzyEqual(point0, split_boundary_face.second) &&
+                 MooseUtils::absoluteFuzzyEqual(point1, split_boundary_face.first)))
               return true;
 
           return false;
@@ -1547,7 +1688,7 @@ DualMeshGenerator::generate()
                               {source_point, sorted_boundary_points[0], sorted_boundary_points[1]});
           }
           else
-            for (std::size_t i = 0; i < sorted_boundary_points.size(); ++i)
+            for (const auto i : index_range(sorted_boundary_points))
             {
               const Point & point0 = sorted_boundary_points[i];
               const Point & point1 =
@@ -1567,58 +1708,12 @@ DualMeshGenerator::generate()
       addPolyhedronOrSplit(polyhedron_side_points, body_centroid_points);
     }
 
-    _console << "DualMeshGenerator 3D raw output mesh volume before downstream converters: "
-             << meshVolume(*dualMesh) << "\n";
-
-    _console << "DualMeshGenerator tetrahedralized " << tetrahedralized_nonconvex_polyhedron_count
-             << " non-convex 3D dual polyhedra into " << tetrahedralized_added_tet_count
-             << " TET4 elements.\n"
-             << "DualMeshGenerator skipped " << skipped_nonconvex_polyhedron_count
-             << " non-convex 3D dual polyhedra.\n"
-             << "DualMeshGenerator tetrahedralized candidate fan volume: "
-             << tetrahedralized_candidate_volume << "\n"
-             << "DualMeshGenerator tetrahedralized accepted fan volume: "
-             << tetrahedralized_accepted_volume << "\n"
-             << "DualMeshGenerator tetrahedralized unaccounted fan volume: "
-             << tetrahedralized_candidate_volume - tetrahedralized_accepted_volume << "\n"
-             << "DualMeshGenerator tetrahedralized surface triangles: flat_skipped="
-             << tetrahedralized_flat_triangle_count
-             << " concave_half_plane_split=" << tetrahedralized_concave_half_plane_triangle_count
-             << "\n";
-
-    std::map<std::string, std::size_t> elem_type_counts;
-    std::map<std::string, Real> elem_type_volumes;
-
-    for (const auto & elem : dualMesh->active_element_ptr_range())
-    {
-      const auto elem_type = Moose::stringify(elem->type());
-      ++elem_type_counts[elem_type];
-      elem_type_volumes[elem_type] += elem->volume();
-    }
-
-    _console << "DualMeshGenerator output element types:";
-
-    if (elem_type_counts.empty())
-      _console << " none";
-    else
-      for (const auto & elem_type_count : elem_type_counts)
-        _console << " " << elem_type_count.first << "=" << elem_type_count.second;
-
-    _console << "\nDualMeshGenerator output volume by element type:";
-
-    if (elem_type_volumes.empty())
-      _console << " none";
-    else
-      for (const auto & elem_type_volume : elem_type_volumes)
-        _console << " " << elem_type_volume.first << "=" << elem_type_volume.second;
-
-    _console << "\n" << std::flush;
-
     dualMesh->unset_is_prepared();
     return dynamic_pointer_cast<MeshBase>(dualMesh);
   }
 
-  // BEGIN 2D
+  // Rest of file is 2D mesh treatment
+  // Calculating tolerance, so they are relative to the input mesh bounding box
   const auto input_bounding_box = MeshTools::create_bounding_box(*input_mesh);
   const Point mesh_extent = input_bounding_box.max() - input_bounding_box.min();
   const Real mesh_scale = std::max(std::max(std::abs(mesh_extent(0)), std::abs(mesh_extent(1))),
@@ -1631,12 +1726,14 @@ DualMeshGenerator::generate()
   std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_midpoints;
   std::vector<BoundarySegment> physical_boundary_segments;
 
+  // Looping through primal elements
   for (const auto & elem : input_mesh->element_ptr_range())
   {
     for (const auto side : elem->side_index_range())
     {
       if (elem->neighbor_ptr(side) == nullptr)
       {
+        // If element has nullptr neighbor we want to record vertices, midpoints, and other info
         auto side_elem = elem->build_side_ptr(side);
 
         if (side_elem->n_nodes() == 2)
@@ -1659,17 +1756,17 @@ DualMeshGenerator::generate()
   }
 
   std::unordered_map<dof_id_type, std::vector<std::size_t>> boundary_node_to_segments;
-
-  for (std::size_t i = 0; i < physical_boundary_segments.size(); ++i)
+  // Building map for boundary segments
+  for (const auto i : index_range(physical_boundary_segments))
   {
     boundary_node_to_segments[physical_boundary_segments[i].node0].push_back(i);
     boundary_node_to_segments[physical_boundary_segments[i].node1].push_back(i);
   }
-
+  // Helper so given a node we can get another node than shares a line segment with it
   const auto otherBoundaryNode = [&](const BoundarySegment & segment,
                                      const dof_id_type node_id) -> dof_id_type
   { return segment.node0 == node_id ? segment.node1 : segment.node0; };
-
+  // Set of vertices we want to add or preserve
   std::unordered_set<dof_id_type> boundary_vertex_nodes;
 
   for (const auto & node_segments : boundary_node_to_segments)
@@ -1703,12 +1800,12 @@ DualMeshGenerator::generate()
     cos_angle = std::max(Real(-1.0), std::min(Real(1.0), cos_angle));
 
     if (std::abs(libMesh::pi - std::acos(cos_angle)) > _boundary_node_angular_tol)
-      boundary_vertex_nodes.insert(node_id);
+      boundary_vertex_nodes.insert(node_id); // Records vertices based on tolerance criteria
   }
 
   std::vector<std::pair<Point, Point>> boundary_clip_segments;
   std::vector<bool> used_boundary_segments(physical_boundary_segments.size(), false);
-
+  // Helper to find the boundary line we want to clip the mesh along
   const auto traceBoundaryClipSegment =
       [&](const dof_id_type start_node, const std::size_t start_segment_id)
   {
@@ -1748,7 +1845,7 @@ DualMeshGenerator::generate()
       current_segment_id = next_segment_id;
     }
   };
-
+  // Now we actually trace these lines
   for (const auto boundary_vertex_node : boundary_vertex_nodes)
   {
     const auto node_segment_it = boundary_node_to_segments.find(boundary_vertex_node);
@@ -1760,11 +1857,12 @@ DualMeshGenerator::generate()
       if (!used_boundary_segments[segment_id])
         traceBoundaryClipSegment(boundary_vertex_node, segment_id);
   }
-
-  for (std::size_t segment_id = 0; segment_id < physical_boundary_segments.size(); ++segment_id)
+  // Now we clip along the traced lines
+  for (const auto segment_id : index_range(physical_boundary_segments))
     if (!used_boundary_segments[segment_id])
       traceBoundaryClipSegment(physical_boundary_segments[segment_id].node0, segment_id);
 
+  // Now for actually finding the dual
   std::vector<Point> dual_centers;
   std::unordered_map<dof_id_type, dof_id_type> source_elem_to_center_id;
   std::unordered_map<dof_id_type, std::vector<const Elem *>> source_node_to_elems;
@@ -1772,6 +1870,7 @@ DualMeshGenerator::generate()
 
   if (use_voronoi)
   {
+    // tri_mesh input is the pure primal mesh
     tri_mesh = buildReplicatedMesh(2);
 
     for (const auto & node : input_mesh->node_ptr_range())
@@ -1783,6 +1882,8 @@ DualMeshGenerator::generate()
       tri_mesh->add_elem(std::move(node_elem));
     }
 
+    // We're circumscribing this inside a large box that is scaled to the bounding box of the primal
+    // mesh, then we'll take the Delaunay triangulation
     const Real outer_padding = 10.0 * mesh_scale;
     const Point outer_min(input_bounding_box.min()(0) - outer_padding,
                           input_bounding_box.min()(1) - outer_padding,
@@ -1810,11 +1911,12 @@ DualMeshGenerator::generate()
     triangulator.minimum_angle() = 0;
     triangulator.desired_area() = 0;
 
-    triangulator.insert_extra_points() = false;
-    triangulator.smooth_after_generating() = false;
+    triangulator.insert_extra_points() = false;     // Don't add new nodes!
+    triangulator.smooth_after_generating() = false; // Don't mess up geometry
 
     triangulator.triangulate();
 
+    // Now for Voronoi, we loop over the triangles and get the circumcenters, etc
     for (const auto & tri_elem : tri_mesh->element_ptr_range())
     {
       if (tri_elem->n_vertices() != 3)
@@ -1830,7 +1932,7 @@ DualMeshGenerator::generate()
         source_node_to_elems[tri_elem->node_id(n)].push_back(tri_elem);
     }
   }
-  else
+  else // For barycentric, loop over elements and get centroids
   {
     for (const auto & elem : input_mesh->element_ptr_range())
     {
@@ -1843,9 +1945,9 @@ DualMeshGenerator::generate()
         source_node_to_elems[elem->node_id(n)].push_back(elem);
     }
   }
-
+  // Now we've gathered our centers and boundary info, we can now build the dual
   auto dualMesh = buildReplicatedMesh(2);
-
+  // Helper to determine if points are within the primal boundary
   const auto pointInsideBoundary = [&](const Point & point)
   {
     bool inside = false;
@@ -1868,7 +1970,7 @@ DualMeshGenerator::generate()
 
     return inside;
   };
-
+  // Actual clipping algorithm
   const auto clipDualPolygonToBoundary = [&](const std::vector<Point> & dual_points)
   {
     std::vector<Point> clipped_points;
@@ -1880,7 +1982,7 @@ DualMeshGenerator::generate()
       if (pointInsideBoundary(point))
         addUniquePoint(clipped_points, point, length_tol);
 
-    for (unsigned int i = 0; i < dual_points.size(); ++i)
+    for (const auto i : index_range(dual_points))
     {
       const Point & p0 = dual_points[i];
       const Point & p1 = dual_points[(i + 1) % dual_points.size()];
@@ -1929,25 +2031,29 @@ DualMeshGenerator::generate()
       addUniquePoint(unique_clipped_points, point, length_tol);
 
     if (unique_clipped_points.size() > 1 &&
-        samePoint(unique_clipped_points.front(), unique_clipped_points.back(), length_tol))
+        MooseUtils::absoluteFuzzyEqual(
+            unique_clipped_points.front(), unique_clipped_points.back(), length_tol))
       unique_clipped_points.pop_back();
 
     return unique_clipped_points;
   };
 
+  // Helper for finding if a node is a boundary vertex
   const auto isBoundaryVertexPoint = [&](const Point & point)
   {
     for (const auto boundary_vertex_node : boundary_vertex_nodes)
     {
       const auto point_it = boundary_node_points.find(boundary_vertex_node);
 
-      if (point_it != boundary_node_points.end() && samePoint(point, point_it->second, length_tol))
+      if (point_it != boundary_node_points.end() &&
+          MooseUtils::absoluteFuzzyEqual(point, point_it->second, length_tol))
         return true;
     }
 
     return false;
   };
 
+  // Helper for finding if a node lies on a boundary segment, for our clipping routine
   const auto isBoundarySegmentPoint = [&](const Point & point)
   {
     for (const auto & boundary_segment : boundary_clip_segments)
@@ -1957,7 +2063,7 @@ DualMeshGenerator::generate()
 
     return false;
   };
-
+  // Concave element indexing helper, used in our later decomposition of concave elems.
   const auto concaveBoundaryVertexIndex = [&](const std::vector<Point> & points) -> std::size_t
   {
     if (points.size() < 4)
@@ -1970,7 +2076,7 @@ DualMeshGenerator::generate()
 
     const Real orientation = signed_area > 0.0 ? 1.0 : -1.0;
 
-    for (std::size_t i = 0; i < points.size(); ++i)
+    for (const auto i : index_range(points))
     {
       const Point & previous = points[(i + points.size() - 1) % points.size()];
       const Point & current = points[i];
@@ -1988,7 +2094,7 @@ DualMeshGenerator::generate()
   {
     auto dual_elem = std::make_unique<libMesh::C0Polygon>(points.size());
 
-    for (unsigned int i = 0; i < points.size(); ++i)
+    for (const auto i : index_range(points))
       dual_elem->set_node(i, dualMesh->add_point(points[i]));
 
     // Fixing flipped elems
@@ -1996,7 +2102,7 @@ DualMeshGenerator::generate()
     {
       auto reversed_elem = std::make_unique<libMesh::C0Polygon>(points.size());
 
-      for (unsigned int i = 0; i < points.size(); ++i)
+      for (const auto i : index_range(points))
         reversed_elem->set_node(i, dualMesh->add_point(points[points.size() - 1 - i]));
 
       dual_elem = std::move(reversed_elem);
@@ -2014,8 +2120,8 @@ DualMeshGenerator::generate()
 
     std::vector<std::vector<unsigned int>> adjacency(incident_elems.size());
 
-    for (unsigned int i = 0; i < incident_elems.size(); ++i)
-      for (unsigned int j = i + 1; j < incident_elems.size(); ++j)
+    for (const auto i : index_range(incident_elems))
+      for (const auto j : make_range(i + 1, incident_elems.size()))
         if (elementsShareTwoNodes(incident_elems[i], incident_elems[j]))
         {
           adjacency[i].push_back(j);
@@ -2025,7 +2131,7 @@ DualMeshGenerator::generate()
     // Start at an endpoint for boundary chains, otherwise start anywhere.
     unsigned int start = 0;
 
-    for (unsigned int i = 0; i < adjacency.size(); ++i)
+    for (const auto i : index_range(adjacency))
       if (adjacency[i].size() == 1)
       {
         start = i;
@@ -2090,14 +2196,15 @@ DualMeshGenerator::generate()
 
         if (boundary_vertex_nodes.count(source_node_id) &&
             boundary_point_it != boundary_node_points.end())
-          addUniquePoint(dual_points, boundary_point_it->second, length_tol);
+          addUniquePoint(dual_points, boundary_point_it->second, length_tol); // Add primal vertices
 
         for (const auto & midpoint : boundary_midpoint_it->second)
           addUniquePoint(dual_points, midpoint, length_tol);
 
         if (boundary_point_it != boundary_node_points.end() && !source_center_points.empty())
         {
-          Point center_average;
+          Point center_average; // Our source center is not quite the centroid, it's the midpoint
+                                // between the dual nodes' centroid and the primal boundary point.
 
           for (const auto & center_point : source_center_points)
             center_average += center_point;
@@ -2106,6 +2213,8 @@ DualMeshGenerator::generate()
 
           const Point sort_center = 0.5 * (boundary_point_it->second + center_average);
 
+          // Sorting is necessary, as the centroid ordering is jumbled after adding vertices and
+          // midpoints.
           std::sort(dual_points.begin(),
                     dual_points.end(),
                     [&sort_center](const Point & a, const Point & b)
@@ -2118,6 +2227,7 @@ DualMeshGenerator::generate()
     }
 
     if (dual_points.size() >= 3)
+      // Finally, clipping back to boundary.
       dual_points = clipDualPolygonToBoundary(dual_points);
 
     if (dual_points.size() < 3)
@@ -2132,7 +2242,7 @@ DualMeshGenerator::generate()
 
       // We use phi sorting only for concave dual elements, since the id's are always too jumbled to
       // sort by adjacency
-      for (std::size_t i = 0; i < dual_points.size(); ++i)
+      for (const auto i : index_range(dual_points))
       {
         if (i == concave_vertex_index)
           continue;
@@ -2148,7 +2258,7 @@ DualMeshGenerator::generate()
 
       std::vector<Point> fan_points = {corner_point};
 
-      for (std::size_t i = 0; i < sorted_points.size(); ++i)
+      for (const auto i : index_range(sorted_points))
       {
         if (!isBoundarySegmentPoint(sorted_points[i].first))
           continue;
@@ -2160,7 +2270,8 @@ DualMeshGenerator::generate()
         // triangle that bridges across a boundary
         if (!isBoundarySegmentPoint(sorted_points[next_i].first))
         {
-          for (std::size_t k = 0; k < sorted_points.size(); ++k)
+          // Now we can fan out triangles to break up otherwise concave dual elements
+          for (const auto k : index_range(sorted_points))
             fan_points.push_back(sorted_points[(i + k) % sorted_points.size()].first);
 
           break;
@@ -2168,7 +2279,7 @@ DualMeshGenerator::generate()
 
         if (!isBoundarySegmentPoint(sorted_points[prev_i].first))
         {
-          for (std::size_t k = 0; k < sorted_points.size(); ++k)
+          for (const auto k : index_range(sorted_points))
             fan_points.push_back(
                 sorted_points[(i + sorted_points.size() - k) % sorted_points.size()].first);
 
@@ -2176,14 +2287,17 @@ DualMeshGenerator::generate()
         }
       }
 
-      for (std::size_t i = 1; i + 1 < fan_points.size(); ++i)
+      if (fan_points.size() >= 3)
       {
-        const std::vector<Point> triangle_points = {
-            fan_points[0], fan_points[i], fan_points[i + 1]};
+        for (const auto i : make_range(std::size_t(1), fan_points.size() - 1))
+        {
+          const std::vector<Point> triangle_points = {
+              fan_points[0], fan_points[i], fan_points[i + 1]};
 
-        if (std::abs(cross2D(triangle_points[0], triangle_points[1], triangle_points[2])) >
-            area_tol)
-          addDualElement(triangle_points);
+          if (std::abs(cross2D(triangle_points[0], triangle_points[1], triangle_points[2])) >
+              area_tol)
+            addDualElement(triangle_points);
+        }
       }
 
       continue;
