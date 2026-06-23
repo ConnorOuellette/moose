@@ -61,6 +61,10 @@ DualMeshGenerator::validParams()
       "geometry_relative_tol>=0",
       "Relative tolerance used for geometric point comparison, intersection, and area checks. The "
       "generator scales this value by the input mesh bounding-box size.");
+  params.addParam<bool>(
+      "debug_output",
+      false,
+      "Whether to print diagnostic information for the 3D dual construction path.");
   params.addClassDescription("Takes a 2D or 3D mesh as input and returns a dual mesh, i.e., "
                              "changes each input node into an element and each input element "
                              "into a node located at its circumcenter or centroid.");
@@ -72,7 +76,8 @@ DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
     _input(getMesh("input")),
     _dual_mesh_type(getParam<MooseEnum>("dual_mesh_type")),
     _boundary_node_angular_tol(getParam<Real>("boundary_node_angular_tol")),
-    _geometry_relative_tol(getParam<Real>("geometry_relative_tol"))
+    _geometry_relative_tol(getParam<Real>("geometry_relative_tol")),
+    _debug_output(getParam<bool>("debug_output"))
 {
 }
 
@@ -400,73 +405,6 @@ pointOnTriangle3D(
 }
 
 static bool
-segmentTriangleBoundsOverlap3D(const Point & point0,
-                               const Point & point1,
-                               const Point & a,
-                               const Point & b,
-                               const Point & c,
-                               const Real tol = 1e-12)
-{
-  for (const auto i : make_range(std::size_t(3)))
-  {
-    const Real segment_min = std::min(point0(i), point1(i)) - tol;
-    const Real segment_max = std::max(point0(i), point1(i)) + tol;
-    const Real triangle_min = std::min(std::min(a(i), b(i)), c(i)) - tol;
-    const Real triangle_max = std::max(std::max(a(i), b(i)), c(i)) + tol;
-
-    if (segment_max < triangle_min || triangle_max < segment_min)
-      return false;
-  }
-
-  return true;
-}
-
-static bool
-segmentIntersectsTriangleInterior3D(const Point & point0,
-                                    const Point & point1,
-                                    const Point & a,
-                                    const Point & b,
-                                    const Point & c,
-                                    const Real tol = 1e-12)
-{
-  const Point direction = point1 - point0;
-  const Real segment_length = direction.norm();
-
-  if (segment_length <= tol)
-    return false;
-
-  if (!segmentTriangleBoundsOverlap3D(point0, point1, a, b, c, tol))
-    return false;
-
-  const Point edge0 = b - a;
-  const Point edge1 = c - a;
-  const Point h = direction.cross(edge1);
-  const Real det = edge0 * h;
-  const Real det_tol = tol * segment_length * edge0.norm() * edge1.norm();
-
-  if (std::abs(det) <= det_tol)
-    return false;
-
-  const Real inverse_det = 1.0 / det;
-  const Point s = point0 - a;
-  const Real u = inverse_det * (s * h);
-  const Real parameter_tol = 1e-8;
-
-  if (u < -parameter_tol || u > 1.0 + parameter_tol)
-    return false;
-
-  const Point q = s.cross(edge0);
-  const Real v = inverse_det * (direction * q);
-
-  if (v < -parameter_tol || u + v > 1.0 + parameter_tol)
-    return false;
-
-  const Real t = inverse_det * (edge1 * q);
-
-  return t > parameter_tol && t < 1.0 - parameter_tol;
-}
-
-static bool
 pointInsideTriangulatedSurface3D(const Point & point,
                                  const std::vector<std::vector<Point>> & surface_triangles,
                                  const Real tol = 1e-12)
@@ -536,9 +474,11 @@ surfaceTriangles3D(const std::vector<std::vector<Point>> & side_points,
         const Point & point1 = side[(anchor + i) % side.size()];
         const Point & point2 = side[(anchor + i + 1) % side.size()];
         const std::vector<Point> triangle = {point0, point1, point2};
+        const bool point0_point1_is_diagonal = i > 1;
+        const bool point2_point0_is_diagonal = i < side.size() - 2;
 
-        if (!valid_segment(point0, point1) || !valid_segment(point1, point2) ||
-            !valid_segment(point2, point0))
+        if ((point0_point1_is_diagonal && !valid_segment(point0, point1)) ||
+            (point2_point0_is_diagonal && !valid_segment(point2, point0)))
         {
           valid_fan = false;
           break;
@@ -589,6 +529,54 @@ DualMeshGenerator::generate()
                  std::max(std::abs(mesh_extent(2)), std::numeric_limits<Real>::min()));
     const Real primal_boundary_length_tol =
         std::max(_geometry_relative_tol, Real(1e-12)) * mesh_scale;
+
+    struct DebugCounts
+    {
+      std::size_t dual_cells = 0;
+      std::size_t boundary_cells = 0;
+      std::size_t angled_boundary_normal_cells = 0;
+      std::size_t concave_boundary_chord_checks = 0;
+      std::size_t concave_boundary_chord_cells = 0;
+      std::size_t forced_tetrahedralized_cells = 0;
+      std::size_t max_boundary_face_centroids = 0;
+      std::size_t c0_polyhedron_attempted = 0;
+      std::size_t c0_polyhedron_succeeded = 0;
+      std::size_t c0_polyhedron_rejected = 0;
+      std::size_t c0_polyhedron_not_implemented = 0;
+      std::size_t c0_polyhedron_logic_error = 0;
+      std::size_t tetrahedralization_attempted = 0;
+      std::size_t tetrahedralization_after_c0_rejection = 0;
+      std::size_t surface_triangulation_failed = 0;
+      std::size_t netgen_attempted = 0;
+      std::size_t netgen_succeeded = 0;
+      std::size_t netgen_threw = 0;
+      std::size_t netgen_empty = 0;
+      std::size_t netgen_tet_outside_primal_boundary = 0;
+      std::size_t netgen_unavailable = 0;
+      std::size_t netgen_generated_tets = 0;
+      std::size_t surface_segment_validation_checked = 0;
+      std::size_t primal_boundary_point_checks = 0;
+      std::size_t primal_boundary_segment_checks = 0;
+      std::size_t primal_boundary_segment_sample_rejections = 0;
+    } debug_counts;
+
+    const auto incrementDebugCount = [&](std::size_t & count)
+    {
+      if (_debug_output)
+        ++count;
+    };
+
+    const auto addDebugCount = [&](std::size_t & count, const std::size_t value)
+    {
+      if (_debug_output)
+        count += value;
+    };
+
+    const auto updateMaxDebugCount = [&](std::size_t & count, const std::size_t value)
+    {
+      if (_debug_output)
+        count = std::max(count, value);
+    };
 
     std::unordered_map<dof_id_type, std::vector<Point>> boundary_node_normals;
     std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>> boundary_edge_normals;
@@ -688,20 +676,22 @@ DualMeshGenerator::generate()
 
     const auto pointInsidePrimalBoundary = [&](const Point & point)
     {
+      incrementDebugCount(debug_counts.primal_boundary_point_checks);
+
       return pointInsideTriangulatedSurface3D(
           point, primal_boundary_surface_triangles, primal_boundary_length_tol);
     };
 
     const auto segmentInsidePrimalBoundary = [&](const Point & point0, const Point & point1)
     {
-      for (const auto & triangle : primal_boundary_surface_triangles)
-        if (segmentIntersectsTriangleInterior3D(
-                point0, point1, triangle[0], triangle[1], triangle[2], primal_boundary_length_tol))
-          return false;
+      incrementDebugCount(debug_counts.primal_boundary_segment_checks);
 
       for (const auto fraction : {0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875})
         if (!pointInsidePrimalBoundary(point0 + fraction * (point1 - point0)))
+        {
+          incrementDebugCount(debug_counts.primal_boundary_segment_sample_rejections);
           return false;
+        }
 
       return true;
     };
@@ -757,11 +747,13 @@ DualMeshGenerator::generate()
       libmesh_try { dual_elem = std::make_unique<libMesh::C0Polyhedron>(sides, mid_elem_node); }
       libmesh_catch(const libMesh::NotImplemented &)
       {
+        incrementDebugCount(debug_counts.c0_polyhedron_not_implemented);
         deleteLocalNodes();
         return false;
       }
       libmesh_catch(const libMesh::LogicError &)
       {
+        incrementDebugCount(debug_counts.c0_polyhedron_logic_error);
         deleteLocalNodes();
         return false;
       }
@@ -775,11 +767,24 @@ DualMeshGenerator::generate()
     };
 
     const auto addPolyhedron = [&](const std::vector<std::vector<Point>> & side_points)
-    { return tryAddPolyhedron(*dualMesh, side_points); };
+    {
+      incrementDebugCount(debug_counts.c0_polyhedron_attempted);
+
+      if (tryAddPolyhedron(*dualMesh, side_points))
+      {
+        incrementDebugCount(debug_counts.c0_polyhedron_succeeded);
+        return true;
+      }
+
+      incrementDebugCount(debug_counts.c0_polyhedron_rejected);
+      return false;
+    };
 
     const auto addTetrahedralizedPolyhedron =
         [&](const std::vector<std::vector<Point>> & side_points) -> bool
     {
+      incrementDebugCount(debug_counts.tetrahedralization_attempted);
+
       if (side_points.size() < 4)
         return false;
 
@@ -789,16 +794,22 @@ DualMeshGenerator::generate()
       const Real volume_tol = length_tol * length_tol * length_tol;
       std::vector<std::vector<Point>> surface_triangles;
 
-      const auto validPrimalBoundarySegment = [&](const Point & point0, const Point & point1)
+      incrementDebugCount(debug_counts.surface_segment_validation_checked);
+
+      const auto validSurfaceSegment = [&](const Point & point0, const Point & point1)
       { return segmentInsidePrimalBoundary(point0, point1); };
 
-      if (!surfaceTriangles3D(
-              side_points, surface_triangles, validPrimalBoundarySegment, length_tol))
+      if (!surfaceTriangles3D(side_points, surface_triangles, validSurfaceSegment, length_tol))
+      {
+        incrementDebugCount(debug_counts.surface_triangulation_failed);
         return false;
+      }
 
       const auto addNetgenTetrahedralizedSurface = [&]()
       {
 #ifdef LIBMESH_HAVE_NETGEN
+        incrementDebugCount(debug_counts.netgen_attempted);
+
         const Real netgen_desired_volume =
             std::max(volume_tol, polyhedron_scale * polyhedron_scale * polyhedron_scale);
         auto netgen_mesh = buildReplicatedMesh(3);
@@ -833,7 +844,11 @@ DualMeshGenerator::generate()
         netgen.desired_volume() = netgen_desired_volume;
 
         libmesh_try { netgen.triangulate(); }
-        libmesh_catch(...) { return false; }
+        libmesh_catch(...)
+        {
+          incrementDebugCount(debug_counts.netgen_threw);
+          return false;
+        }
 
         std::vector<std::array<Point, 4>> generated_tets;
 
@@ -853,13 +868,22 @@ DualMeshGenerator::generate()
               (tet_points[0] + tet_points[1] + tet_points[2] + tet_points[3]) / 4.0;
 
           if (!pointInsidePrimalBoundary(tet_center))
+          {
+            incrementDebugCount(debug_counts.netgen_tet_outside_primal_boundary);
             return false;
+          }
 
           generated_tets.push_back(tet_points);
         }
 
         if (generated_tets.empty())
+        {
+          incrementDebugCount(debug_counts.netgen_empty);
           return false;
+        }
+
+        incrementDebugCount(debug_counts.netgen_succeeded);
+        addDebugCount(debug_counts.netgen_generated_tets, generated_tets.size());
 
         std::vector<Node *> local_nodes;
 
@@ -897,6 +921,7 @@ DualMeshGenerator::generate()
 
         return true;
 #else
+        incrementDebugCount(debug_counts.netgen_unavailable);
         return false;
 #endif
       };
@@ -904,305 +929,7 @@ DualMeshGenerator::generate()
       if (addNetgenTetrahedralizedSurface())
         return true;
 
-      std::vector<Point> unique_points;
-
-      for (const auto & side : side_points)
-        for (const auto & point : side)
-          addUniquePoint(unique_points, point, length_tol);
-
-      if (unique_points.size() < 4)
-        return false;
-
-      Point vertex_center;
-
-      for (const auto & point : unique_points)
-        vertex_center += point;
-
-      vertex_center /= unique_points.size();
-
-      Point surface_center;
-      Real surface_weight = 0.0;
-
-      for (const auto & triangle : surface_triangles)
-      {
-        const Real triangle_weight =
-            (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]).norm();
-
-        surface_center += triangle_weight * (triangle[0] + triangle[1] + triangle[2]) / 3.0;
-        surface_weight += triangle_weight;
-      }
-
-      if (surface_weight > length_tol * length_tol)
-        surface_center /= surface_weight;
-      else
-        surface_center = vertex_center;
-
-      std::vector<Point> candidate_points;
-
-      const auto addCandidatePoint = [&](const Point & point)
-      {
-        if (!pointInsidePrimalBoundary(point) ||
-            !pointInsideTriangulatedSurface3D(point, surface_triangles, length_tol))
-          return;
-
-        addUniquePoint(candidate_points, point, length_tol);
-      };
-
-      addCandidatePoint(vertex_center);
-      addCandidatePoint(surface_center);
-      addCandidatePoint(0.5 * (vertex_center + surface_center));
-
-      for (const auto & point : unique_points)
-        for (const auto fraction : {0.25, 0.5, 0.75})
-        {
-          addCandidatePoint(vertex_center + fraction * (point - vertex_center));
-          addCandidatePoint(surface_center + fraction * (point - surface_center));
-        }
-
-      for (const auto & triangle : surface_triangles)
-      {
-        const Point triangle_center = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
-        Point triangle_normal = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
-
-        for (const auto fraction : {0.25, 0.5, 0.75})
-        {
-          addCandidatePoint(vertex_center + fraction * (triangle_center - vertex_center));
-          addCandidatePoint(surface_center + fraction * (triangle_center - surface_center));
-        }
-
-        if (triangle_normal.norm() > length_tol)
-        {
-          triangle_normal /= triangle_normal.norm();
-
-          Real triangle_scale = 1.0;
-
-          for (const auto i : index_range(triangle))
-            triangle_scale = std::max(triangle_scale,
-                                      (triangle[(i + 1) % triangle.size()] - triangle[i]).norm());
-
-          for (const auto sign : {-1.0, 1.0})
-            for (const auto fraction : {0.05, 0.1, 0.2, 0.35})
-              addCandidatePoint(triangle_center +
-                                sign * fraction * triangle_scale * triangle_normal);
-        }
-      }
-
-      if (candidate_points.empty())
-        return false;
-
-      const auto candidateCoversTriangle =
-          [&](const Point & candidate_point, const std::vector<Point> & triangle)
-      {
-        if (std::abs(tetVolume6(candidate_point, triangle[0], triangle[1], triangle[2])) <=
-            volume_tol)
-          return false;
-
-        const Point triangle_center = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
-
-        if (!pointInsidePrimalBoundary(triangle_center))
-          return false;
-
-        if (!segmentInsidePrimalBoundary(candidate_point, triangle_center))
-          return false;
-
-        for (const auto fraction : {0.25, 0.5})
-          if (!pointInsideTriangulatedSurface3D(candidate_point +
-                                                    fraction * (triangle_center - candidate_point),
-                                                surface_triangles,
-                                                length_tol))
-            return false;
-
-        const Point tet_center = (candidate_point + triangle[0] + triangle[1] + triangle[2]) / 4.0;
-
-        return pointInsidePrimalBoundary(tet_center) &&
-               pointInsideTriangulatedSurface3D(tet_center, surface_triangles, length_tol);
-      };
-
-      const auto candidateWeaklyCoversTriangle =
-          [&](const Point & candidate_point, const std::vector<Point> & triangle)
-      {
-        if (std::abs(tetVolume6(candidate_point, triangle[0], triangle[1], triangle[2])) <=
-            volume_tol)
-          return false;
-
-        const Point triangle_center = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
-
-        if (!pointInsidePrimalBoundary(triangle_center))
-          return false;
-
-        if (!segmentInsidePrimalBoundary(candidate_point, triangle_center))
-          return false;
-
-        const Point tet_center = (candidate_point + triangle[0] + triangle[1] + triangle[2]) / 4.0;
-
-        return pointInsidePrimalBoundary(tet_center) &&
-               pointInsideTriangulatedSurface3D(tet_center, surface_triangles, length_tol);
-      };
-
-      Point selected_candidate_point;
-      std::vector<std::size_t> selected_triangle_indices;
-
-      const auto coveredTriangleIndices =
-          [&](const Point & candidate_point, const auto & covers_triangle)
-      {
-        std::vector<std::size_t> candidate_triangle_indices;
-
-        for (const auto triangle_i : index_range(surface_triangles))
-          if (covers_triangle(candidate_point, surface_triangles[triangle_i]))
-            candidate_triangle_indices.push_back(triangle_i);
-
-        return candidate_triangle_indices;
-      };
-
-      const auto selectSingleCandidate = [&](const auto & covers_triangle)
-      {
-        for (const auto & candidate_point : candidate_points)
-        {
-          const auto candidate_triangle_indices =
-              coveredTriangleIndices(candidate_point, covers_triangle);
-
-          if (candidate_triangle_indices.size() == surface_triangles.size())
-          {
-            selected_candidate_point = candidate_point;
-            selected_triangle_indices = candidate_triangle_indices;
-            return true;
-          }
-        }
-
-        return false;
-      };
-
-      const auto addVisibilityCandidate = [&](const auto & covers_triangle)
-      {
-        Point best_candidate_point;
-        std::vector<std::size_t> best_triangle_indices;
-
-        for (const auto & candidate_point : candidate_points)
-        {
-          const auto candidate_triangle_indices =
-              coveredTriangleIndices(candidate_point, covers_triangle);
-
-          if (candidate_triangle_indices.size() > best_triangle_indices.size())
-          {
-            best_candidate_point = candidate_point;
-            best_triangle_indices = candidate_triangle_indices;
-          }
-        }
-
-        if (best_triangle_indices.empty() ||
-            best_triangle_indices.size() == surface_triangles.size())
-          return false;
-
-        std::vector<bool> covered_triangles(surface_triangles.size(), false);
-
-        for (const auto triangle_i : best_triangle_indices)
-          covered_triangles[triangle_i] = true;
-
-        Point uncovered_center;
-        Real uncovered_weight = 0.0;
-        std::vector<Point> uncovered_triangle_centers;
-
-        for (const auto triangle_i : index_range(surface_triangles))
-        {
-          if (covered_triangles[triangle_i])
-            continue;
-
-          const auto & triangle = surface_triangles[triangle_i];
-          const Point triangle_center = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
-          const Real triangle_weight =
-              (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]).norm();
-
-          uncovered_center += triangle_weight * triangle_center;
-          uncovered_weight += triangle_weight;
-          uncovered_triangle_centers.push_back(triangle_center);
-        }
-
-        if (uncovered_weight <= length_tol * length_tol)
-          return false;
-
-        uncovered_center /= uncovered_weight;
-
-        const std::size_t old_candidate_count = candidate_points.size();
-
-        for (const auto fraction : {0.25, 0.5, 0.75})
-          addCandidatePoint(best_candidate_point +
-                            fraction * (uncovered_center - best_candidate_point));
-
-        for (const auto & triangle_center : uncovered_triangle_centers)
-          for (const auto fraction : {0.5, 0.75})
-            addCandidatePoint(best_candidate_point +
-                              fraction * (triangle_center - best_candidate_point));
-
-        return candidate_points.size() > old_candidate_count;
-      };
-
-      if (!selectSingleCandidate(candidateCoversTriangle))
-        for (const auto i : make_range(4))
-        {
-          if (!addVisibilityCandidate(candidateCoversTriangle))
-            break;
-
-          if (selectSingleCandidate(candidateCoversTriangle))
-            break;
-        }
-
-      if (selected_triangle_indices.empty() &&
-          !selectSingleCandidate(candidateWeaklyCoversTriangle))
-        for (const auto i : make_range(4))
-        {
-          if (!addVisibilityCandidate(candidateWeaklyCoversTriangle))
-            break;
-
-          if (selectSingleCandidate(candidateWeaklyCoversTriangle))
-            break;
-        }
-
-      if (selected_triangle_indices.empty())
-        return false;
-
-      std::vector<Node *> local_nodes;
-
-      const auto getLocalNode = [&](const Point & point)
-      {
-        for (auto * const node : local_nodes)
-          if (MooseUtils::absoluteFuzzyEqual(*node, point, length_tol))
-            return node;
-
-        Node * const node = dualMesh->add_point(point);
-        local_nodes.push_back(node);
-
-        return node;
-      };
-
-      Node * const interior_node = getLocalNode(selected_candidate_point);
-
-      for (const auto triangle_i : selected_triangle_indices)
-      {
-        const auto & triangle = surface_triangles[triangle_i];
-
-        if (std::abs(tetVolume6(selected_candidate_point, triangle[0], triangle[1], triangle[2])) <=
-            volume_tol)
-          continue;
-
-        auto tet = std::make_unique<Tet4>();
-        tet->set_node(0) = interior_node;
-        tet->set_node(1) = getLocalNode(triangle[0]);
-
-        if (tetVolume6(selected_candidate_point, triangle[0], triangle[1], triangle[2]) > 0.0)
-        {
-          tet->set_node(2) = getLocalNode(triangle[1]);
-          tet->set_node(3) = getLocalNode(triangle[2]);
-        }
-        else
-        {
-          tet->set_node(2) = getLocalNode(triangle[2]);
-          tet->set_node(3) = getLocalNode(triangle[1]);
-        }
-
-        dualMesh->add_elem(std::move(tet));
-      }
-
-      return true;
+      return false;
     };
 
     const auto addPolyhedronOrTetrahedralize =
@@ -1210,6 +937,9 @@ DualMeshGenerator::generate()
     {
       if (!force_tetrahedralize && addPolyhedron(side_points))
         return;
+
+      if (!force_tetrahedralize)
+        incrementDebugCount(debug_counts.tetrahedralization_after_c0_rejection);
 
       if (!addTetrahedralizedPolyhedron(side_points))
         mooseError("Could not tetrahedralize rejected non-convex 3D dual polyhedron.");
@@ -1397,10 +1127,91 @@ DualMeshGenerator::generate()
       if (polyhedron_side_points.size() < 4)
         continue;
 
-      const bool force_tetrahedralize = hasAngledBoundaryNormals(source_node_id) &&
-                                        hasConcaveBoundaryChord(boundary_face_centroids);
+      incrementDebugCount(debug_counts.dual_cells);
+
+      if (!boundary_face_centroids.empty())
+        incrementDebugCount(debug_counts.boundary_cells);
+
+      updateMaxDebugCount(debug_counts.max_boundary_face_centroids, boundary_face_centroids.size());
+
+      const bool has_angled_boundary_normals = hasAngledBoundaryNormals(source_node_id);
+
+      if (has_angled_boundary_normals)
+        incrementDebugCount(debug_counts.angled_boundary_normal_cells);
+
+      bool has_concave_boundary_chord = false;
+
+      if (has_angled_boundary_normals)
+      {
+        incrementDebugCount(debug_counts.concave_boundary_chord_checks);
+        has_concave_boundary_chord = hasConcaveBoundaryChord(boundary_face_centroids);
+
+        if (has_concave_boundary_chord)
+          incrementDebugCount(debug_counts.concave_boundary_chord_cells);
+      }
+
+      const bool force_tetrahedralize = has_angled_boundary_normals && has_concave_boundary_chord;
+
+      if (force_tetrahedralize)
+        incrementDebugCount(debug_counts.forced_tetrahedralized_cells);
+
       addPolyhedronOrTetrahedralize(polyhedron_side_points, force_tetrahedralize);
     }
+
+    if (_debug_output)
+      mooseInfo("DualMeshGenerator 3D debug summary:\n",
+                "  dual cells: ",
+                debug_counts.dual_cells,
+                "\n  boundary cells: ",
+                debug_counts.boundary_cells,
+                "\n  angled boundary-normal cells: ",
+                debug_counts.angled_boundary_normal_cells,
+                "\n  concave boundary-chord checks / hits: ",
+                debug_counts.concave_boundary_chord_checks,
+                " / ",
+                debug_counts.concave_boundary_chord_cells,
+                "\n  forced tetrahedralized cells: ",
+                debug_counts.forced_tetrahedralized_cells,
+                "\n  max boundary face centroids on one cell: ",
+                debug_counts.max_boundary_face_centroids,
+                "\n  C0Polyhedron attempted / succeeded / rejected: ",
+                debug_counts.c0_polyhedron_attempted,
+                " / ",
+                debug_counts.c0_polyhedron_succeeded,
+                " / ",
+                debug_counts.c0_polyhedron_rejected,
+                "\n  C0Polyhedron NotImplemented / LogicError: ",
+                debug_counts.c0_polyhedron_not_implemented,
+                " / ",
+                debug_counts.c0_polyhedron_logic_error,
+                "\n  tetrahedralization attempted / after C0 rejection: ",
+                debug_counts.tetrahedralization_attempted,
+                " / ",
+                debug_counts.tetrahedralization_after_c0_rejection,
+                "\n  surface triangulation failures: ",
+                debug_counts.surface_triangulation_failed,
+                "\n  surface segment validation checked: ",
+                debug_counts.surface_segment_validation_checked,
+                "\n  NetGen attempted / succeeded / generated TET4s: ",
+                debug_counts.netgen_attempted,
+                " / ",
+                debug_counts.netgen_succeeded,
+                " / ",
+                debug_counts.netgen_generated_tets,
+                "\n  NetGen threw / empty / outside primal / unavailable: ",
+                debug_counts.netgen_threw,
+                " / ",
+                debug_counts.netgen_empty,
+                " / ",
+                debug_counts.netgen_tet_outside_primal_boundary,
+                " / ",
+                debug_counts.netgen_unavailable,
+                "\n  primal boundary point / segment checks: ",
+                debug_counts.primal_boundary_point_checks,
+                " / ",
+                debug_counts.primal_boundary_segment_checks,
+                "\n  primal boundary segment sampled-point rejections: ",
+                debug_counts.primal_boundary_segment_sample_rejections);
 
     dualMesh->unset_is_prepared();
     return dynamic_pointer_cast<MeshBase>(dualMesh);
