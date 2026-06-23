@@ -400,6 +400,28 @@ pointOnTriangle3D(
 }
 
 static bool
+segmentTriangleBoundsOverlap3D(const Point & point0,
+                               const Point & point1,
+                               const Point & a,
+                               const Point & b,
+                               const Point & c,
+                               const Real tol = 1e-12)
+{
+  for (const auto i : make_range(std::size_t(3)))
+  {
+    const Real segment_min = std::min(point0(i), point1(i)) - tol;
+    const Real segment_max = std::max(point0(i), point1(i)) + tol;
+    const Real triangle_min = std::min(std::min(a(i), b(i)), c(i)) - tol;
+    const Real triangle_max = std::max(std::max(a(i), b(i)), c(i)) + tol;
+
+    if (segment_max < triangle_min || triangle_max < segment_min)
+      return false;
+  }
+
+  return true;
+}
+
+static bool
 segmentIntersectsTriangleInterior3D(const Point & point0,
                                     const Point & point1,
                                     const Point & a,
@@ -411,6 +433,9 @@ segmentIntersectsTriangleInterior3D(const Point & point0,
   const Real segment_length = direction.norm();
 
   if (segment_length <= tol)
+    return false;
+
+  if (!segmentTriangleBoundsOverlap3D(point0, point1, a, b, c, tol))
     return false;
 
   const Point edge0 = b - a;
@@ -641,6 +666,26 @@ DualMeshGenerator::generate()
             0.5 * (*input_mesh->node_ptr(edge.first) + *input_mesh->node_ptr(edge.second));
     }
 
+    const Real boundary_normal_dot_tol =
+        std::cos(libMesh::pi - std::min(_boundary_node_angular_tol, libMesh::pi));
+
+    const auto hasAngledBoundaryNormals = [&](const dof_id_type node_id)
+    {
+      const auto normals_it = boundary_node_normals.find(node_id);
+
+      if (normals_it == boundary_node_normals.end())
+        return false;
+
+      const auto & normals = normals_it->second;
+
+      for (const auto i : index_range(normals))
+        for (const auto j : make_range(i + 1, normals.size()))
+          if (normals[i] * normals[j] > boundary_normal_dot_tol)
+            return true;
+
+      return false;
+    };
+
     const auto pointInsidePrimalBoundary = [&](const Point & point)
     {
       return pointInsideTriangulatedSurface3D(
@@ -690,6 +735,12 @@ DualMeshGenerator::generate()
 
       sides.reserve(side_points.size());
 
+      const auto deleteLocalNodes = [&]()
+      {
+        for (auto * const node : local_nodes)
+          mesh.delete_node(node);
+      };
+
       for (const auto & side : side_points)
       {
         auto polygon = std::make_shared<libMesh::C0Polygon>(side.size());
@@ -700,59 +751,31 @@ DualMeshGenerator::generate()
         sides.push_back(polygon);
       }
 
-      libmesh_try
+      std::unique_ptr<libMesh::Node> mid_elem_node;
+      std::unique_ptr<libMesh::C0Polyhedron> dual_elem;
+
+      libmesh_try { dual_elem = std::make_unique<libMesh::C0Polyhedron>(sides, mid_elem_node); }
+      libmesh_catch(const libMesh::NotImplemented &)
       {
-        std::unique_ptr<libMesh::Node> mid_elem_node;
-        auto dual_elem = std::make_unique<libMesh::C0Polyhedron>(sides, mid_elem_node);
-
-        if (mid_elem_node)
-          mesh.add_node(std::move(mid_elem_node));
-
-        mesh.add_elem(std::move(dual_elem));
+        deleteLocalNodes();
+        return false;
       }
-      libmesh_catch(const libMesh::NotImplemented &) { return false; }
-      libmesh_catch(const libMesh::LogicError &) { return false; }
+      libmesh_catch(const libMesh::LogicError &)
+      {
+        deleteLocalNodes();
+        return false;
+      }
+
+      if (mid_elem_node)
+        mesh.add_node(std::move(mid_elem_node));
+
+      mesh.add_elem(std::move(dual_elem));
 
       return true;
     };
 
     const auto addPolyhedron = [&](const std::vector<std::vector<Point>> & side_points)
-    {
-      auto trial_mesh = buildReplicatedMesh(3);
-
-      if (!tryAddPolyhedron(*trial_mesh, side_points))
-        return false;
-
-      return tryAddPolyhedron(*dualMesh, side_points);
-    };
-
-    const auto respectsPrimalBoundary = [&](const std::vector<std::vector<Point>> & side_points)
-    {
-      std::vector<Point> unique_points;
-
-      for (const auto & side : side_points)
-      {
-        Point side_center;
-
-        for (const auto & point : side)
-        {
-          side_center += point;
-          addUniquePoint(unique_points, point, primal_boundary_length_tol);
-        }
-
-        side_center /= side.size();
-
-        if (!pointInsidePrimalBoundary(side_center))
-          return false;
-      }
-
-      for (const auto i : index_range(unique_points))
-        for (const auto j : make_range(i + 1, unique_points.size()))
-          if (!segmentInsidePrimalBoundary(unique_points[i], unique_points[j]))
-            return false;
-
-      return true;
-    };
+    { return tryAddPolyhedron(*dualMesh, side_points); };
 
     const auto addTetrahedralizedPolyhedron =
         [&](const std::vector<std::vector<Point>> & side_points) -> bool
@@ -764,8 +787,6 @@ DualMeshGenerator::generate()
       const Real polyhedron_scale = polyhedronScale3D(side_points);
       const Real length_tol = tol * polyhedron_scale;
       const Real volume_tol = length_tol * length_tol * length_tol;
-      const Real netgen_desired_volume =
-          std::max(volume_tol, polyhedron_scale * polyhedron_scale * polyhedron_scale);
       std::vector<std::vector<Point>> surface_triangles;
 
       const auto validPrimalBoundarySegment = [&](const Point & point0, const Point & point1)
@@ -773,16 +794,13 @@ DualMeshGenerator::generate()
 
       if (!surfaceTriangles3D(
               side_points, surface_triangles, validPrimalBoundarySegment, length_tol))
-      {
-        mooseInfo("DualMeshGenerator: NetGen fallback was not attempted because the rejected "
-                  "polyhedron surface could not be triangulated without crossing the primal "
-                  "boundary.");
         return false;
-      }
 
       const auto addNetgenTetrahedralizedSurface = [&]()
       {
 #ifdef LIBMESH_HAVE_NETGEN
+        const Real netgen_desired_volume =
+            std::max(volume_tol, polyhedron_scale * polyhedron_scale * polyhedron_scale);
         auto netgen_mesh = buildReplicatedMesh(3);
         std::vector<Node *> boundary_nodes;
 
@@ -815,17 +833,7 @@ DualMeshGenerator::generate()
         netgen.desired_volume() = netgen_desired_volume;
 
         libmesh_try { netgen.triangulate(); }
-        libmesh_catch(...)
-        {
-          mooseInfo("DualMeshGenerator: NetGen rejected local fallback surface with ",
-                    boundary_nodes.size(),
-                    " boundary nodes, ",
-                    surface_triangles.size(),
-                    " boundary triangles, and desired volume ",
-                    netgen_desired_volume,
-                    "; trying manual fallback.");
-          return false;
-        }
+        libmesh_catch(...) { return false; }
 
         std::vector<std::array<Point, 4>> generated_tets;
 
@@ -837,33 +845,21 @@ DualMeshGenerator::generate()
           std::array<Point, 4> tet_points = {
               elem->point(0), elem->point(1), elem->point(2), elem->point(3)};
 
-          if (std::abs(tetVolume6(
-                  tet_points[0], tet_points[1], tet_points[2], tet_points[3])) <= volume_tol)
+          if (std::abs(tetVolume6(tet_points[0], tet_points[1], tet_points[2], tet_points[3])) <=
+              volume_tol)
             continue;
 
           const Point tet_center =
               (tet_points[0] + tet_points[1] + tet_points[2] + tet_points[3]) / 4.0;
 
           if (!pointInsidePrimalBoundary(tet_center))
-          {
-            mooseInfo("DualMeshGenerator: NetGen generated a local tet whose centroid was outside "
-                      "the primal boundary; trying manual fallback.");
             return false;
-          }
 
           generated_tets.push_back(tet_points);
         }
 
         if (generated_tets.empty())
-        {
-          mooseInfo("DualMeshGenerator: NetGen completed local fallback but produced no valid "
-                    "TET4 elements; trying manual fallback.");
           return false;
-        }
-
-        mooseInfo("DualMeshGenerator: NetGen tetrahedralized rejected local polyhedron with ",
-                  generated_tets.size(),
-                  " TET4 elements.");
 
         std::vector<Node *> local_nodes;
 
@@ -901,17 +897,12 @@ DualMeshGenerator::generate()
 
         return true;
 #else
-        mooseInfo("DualMeshGenerator: NetGen fallback is unavailable because libMesh was built "
-                  "without NetGen; trying manual fallback.");
         return false;
 #endif
       };
 
       if (addNetgenTetrahedralizedSurface())
         return true;
-
-      mooseInfo("DualMeshGenerator: using manual fallback tetrahedralization for rejected local "
-                "polyhedron.");
 
       std::vector<Point> unique_points;
 
@@ -920,11 +911,7 @@ DualMeshGenerator::generate()
           addUniquePoint(unique_points, point, length_tol);
 
       if (unique_points.size() < 4)
-      {
-        mooseInfo("DualMeshGenerator: manual fallback failed because the rejected local "
-                  "polyhedron has fewer than four unique points.");
         return false;
-      }
 
       Point vertex_center;
 
@@ -1001,11 +988,7 @@ DualMeshGenerator::generate()
       }
 
       if (candidate_points.empty())
-      {
-        mooseInfo("DualMeshGenerator: manual fallback failed because it could not find an "
-                  "interior candidate point inside both the primal boundary and local surface.");
         return false;
-      }
 
       const auto candidateCoversTriangle =
           [&](const Point & candidate_point, const std::vector<Point> & triangle)
@@ -1059,8 +1042,8 @@ DualMeshGenerator::generate()
       Point selected_candidate_point;
       std::vector<std::size_t> selected_triangle_indices;
 
-      const auto coveredTriangleIndices = [&](const Point & candidate_point,
-                                              const auto & covers_triangle)
+      const auto coveredTriangleIndices =
+          [&](const Point & candidate_point, const auto & covers_triangle)
       {
         std::vector<std::size_t> candidate_triangle_indices;
 
@@ -1163,7 +1146,8 @@ DualMeshGenerator::generate()
             break;
         }
 
-      if (selected_triangle_indices.empty() && !selectSingleCandidate(candidateWeaklyCoversTriangle))
+      if (selected_triangle_indices.empty() &&
+          !selectSingleCandidate(candidateWeaklyCoversTriangle))
         for (const auto i : make_range(4))
         {
           if (!addVisibilityCandidate(candidateWeaklyCoversTriangle))
@@ -1174,13 +1158,7 @@ DualMeshGenerator::generate()
         }
 
       if (selected_triangle_indices.empty())
-      {
-        mooseInfo("DualMeshGenerator: manual fallback failed because no candidate interior point "
-                  "could cover all ",
-                  surface_triangles.size(),
-                  " local surface triangles.");
         return false;
-      }
 
       std::vector<Node *> local_nodes;
 
@@ -1228,13 +1206,23 @@ DualMeshGenerator::generate()
     };
 
     const auto addPolyhedronOrTetrahedralize =
-        [&](const std::vector<std::vector<Point>> & side_points)
+        [&](const std::vector<std::vector<Point>> & side_points, const bool force_tetrahedralize)
     {
-      if (respectsPrimalBoundary(side_points) && addPolyhedron(side_points))
+      if (!force_tetrahedralize && addPolyhedron(side_points))
         return;
 
       if (!addTetrahedralizedPolyhedron(side_points))
         mooseError("Could not tetrahedralize rejected non-convex 3D dual polyhedron.");
+    };
+
+    const auto hasConcaveBoundaryChord = [&](const std::vector<Point> & boundary_face_centroids)
+    {
+      for (const auto i : index_range(boundary_face_centroids))
+        for (const auto j : make_range(i + 1, boundary_face_centroids.size()))
+          if (!segmentInsidePrimalBoundary(boundary_face_centroids[i], boundary_face_centroids[j]))
+            return true;
+
+      return false;
     };
 
     // Build one dual cell around each primal node. Concave cells are broken into TET4s using
@@ -1409,7 +1397,9 @@ DualMeshGenerator::generate()
       if (polyhedron_side_points.size() < 4)
         continue;
 
-      addPolyhedronOrTetrahedralize(polyhedron_side_points);
+      const bool force_tetrahedralize = hasAngledBoundaryNormals(source_node_id) &&
+                                        hasConcaveBoundaryChord(boundary_face_centroids);
+      addPolyhedronOrTetrahedralize(polyhedron_side_points, force_tetrahedralize);
     }
 
     dualMesh->unset_is_prepared();
