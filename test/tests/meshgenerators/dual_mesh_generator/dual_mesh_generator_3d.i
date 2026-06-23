@@ -3,7 +3,7 @@
         type = ConcentricCircleMeshGenerator
         num_sectors = 4
         radii = '2 4'
-        rings = '2 2'
+        rings = '3 3'
         has_outer_square = false
         preserve_volumes = false
     []
