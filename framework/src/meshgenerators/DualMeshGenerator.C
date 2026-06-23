@@ -29,6 +29,8 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -60,6 +62,11 @@ DualMeshGenerator::validParams()
       "geometry_relative_tol>=0",
       "Relative tolerance used for geometric point comparison, intersection, and area checks. The "
       "generator scales this value by the input mesh bounding-box size.");
+  params.addParam<bool>(
+      "debug_netgen",
+      false,
+      "Print detailed parent polyhedron and surface triangulation diagnostics when NetGen "
+      "tetrahedralization fails.");
   params.addClassDescription("Takes a 2D or 3D mesh as input and returns a dual mesh, i.e., "
                              "changes each input node into an element and each input element "
                              "into a node located at its circumcenter or centroid.");
@@ -71,7 +78,8 @@ DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
     _input(getMesh("input")),
     _dual_mesh_type(getParam<MooseEnum>("dual_mesh_type")),
     _boundary_node_angular_tol(getParam<Real>("boundary_node_angular_tol")),
-    _geometry_relative_tol(getParam<Real>("geometry_relative_tol"))
+    _geometry_relative_tol(getParam<Real>("geometry_relative_tol")),
+    _debug_netgen(getParam<bool>("debug_netgen"))
 {
 }
 
@@ -320,6 +328,12 @@ addUniqueBoundaryFaceNormal3D(std::vector<BoundaryFaceNormal3D> & face_normals,
 using PointKey3D = std::array<Real, 3>;
 using SegmentKey3D = std::pair<PointKey3D, PointKey3D>;
 
+struct ConnectedFacePoints3D
+{
+  std::vector<Point> points;
+  std::vector<std::pair<Point, Point>> segments;
+};
+
 static PointKey3D
 pointKey3D(const Point & point)
 {
@@ -336,6 +350,36 @@ segmentKey3D(const Point & point0, const Point & point1)
     std::swap(key0, key1);
 
   return {key0, key1};
+}
+
+static void
+addConnectedFacePoint3D(ConnectedFacePoints3D & face_points,
+                        const Point & point,
+                        const Real tol = 1e-12)
+{
+  addUniquePoint(face_points.points, point, tol);
+}
+
+static void
+addConnectedFaceSegment3D(ConnectedFacePoints3D & face_points,
+                          const Point & point0,
+                          const Point & point1,
+                          const Real tol = 1e-12)
+{
+  if (MooseUtils::absoluteFuzzyEqual(point0, point1, tol))
+    return;
+
+  addConnectedFacePoint3D(face_points, point0, tol);
+  addConnectedFacePoint3D(face_points, point1, tol);
+
+  for (const auto & segment : face_points.segments)
+    if ((MooseUtils::absoluteFuzzyEqual(segment.first, point0, tol) &&
+         MooseUtils::absoluteFuzzyEqual(segment.second, point1, tol)) ||
+        (MooseUtils::absoluteFuzzyEqual(segment.first, point1, tol) &&
+         MooseUtils::absoluteFuzzyEqual(segment.second, point0, tol)))
+      return;
+
+  face_points.segments.push_back({point0, point1});
 }
 
 // Sorting, but 3D
@@ -395,6 +439,84 @@ sortPointsAroundAxis3D(const std::vector<Point> & unsorted_points,
     std::reverse(points.begin(), points.end());
 
   return points;
+}
+
+static std::vector<Point>
+sortConnectedFacePoints3D(const ConnectedFacePoints3D & unsorted_face_points,
+                          const Point & axis,
+                          const Real tol = 1e-12)
+{
+  std::vector<Point> points;
+
+  for (const auto & point : unsorted_face_points.points)
+    addUniquePoint(points, point, tol);
+
+  if (points.size() < 3)
+    return points;
+
+  std::vector<std::vector<std::size_t>> point_neighbors(points.size());
+
+  const auto pointIndex = [&](const Point & point) -> std::size_t
+  {
+    for (const auto i : index_range(points))
+      if (MooseUtils::absoluteFuzzyEqual(points[i], point, tol))
+        return i;
+
+    mooseError("Could not locate connected face point while ordering 3D dual face.");
+  };
+
+  const auto addNeighbor = [&](const std::size_t point_index, const std::size_t neighbor_index)
+  {
+    for (const auto existing_neighbor_index : point_neighbors[point_index])
+      if (existing_neighbor_index == neighbor_index)
+        return;
+
+    point_neighbors[point_index].push_back(neighbor_index);
+  };
+
+  for (const auto & segment : unsorted_face_points.segments)
+  {
+    const std::size_t point0_index = pointIndex(segment.first);
+    const std::size_t point1_index = pointIndex(segment.second);
+
+    if (point0_index == point1_index)
+      continue;
+
+    addNeighbor(point0_index, point1_index);
+    addNeighbor(point1_index, point0_index);
+  }
+
+  for (const auto & neighbors : point_neighbors)
+    if (neighbors.size() != 2)
+      return sortPointsAroundAxis3D(points, axis, tol);
+
+  std::vector<Point> ordered_points;
+  std::vector<bool> visited(points.size(), false);
+  std::size_t previous_index = points.size();
+  std::size_t current_index = 0;
+
+  for (const auto i : index_range(points))
+  {
+    if (visited[current_index])
+      return sortPointsAroundAxis3D(points, axis, tol);
+
+    ordered_points.push_back(points[current_index]);
+    visited[current_index] = true;
+
+    const auto & neighbors = point_neighbors[current_index];
+    const std::size_t next_index = neighbors[0] == previous_index ? neighbors[1] : neighbors[0];
+
+    previous_index = current_index;
+    current_index = next_index;
+  }
+
+  if (current_index != 0)
+    return sortPointsAroundAxis3D(points, axis, tol);
+
+  if (axis * faceNormal3D(ordered_points) < 0.0)
+    std::reverse(ordered_points.begin(), ordered_points.end());
+
+  return ordered_points;
 }
 
 static Real
@@ -676,6 +798,11 @@ DualMeshGenerator::generate()
 
     std::map<PointKey3D, bool> primal_boundary_point_cache;
     std::map<SegmentKey3D, bool> primal_boundary_segment_cache;
+    std::size_t direct_polyhedron_elements = 0;
+    std::size_t forced_tetrahedralized_cells = 0;
+    std::size_t forced_tetrahedralized_elements = 0;
+    std::size_t fallback_tetrahedralized_cells = 0;
+    std::size_t fallback_tetrahedralized_elements = 0;
 
     const auto pointInsidePrimalBoundary = [&](const Point & point)
     {
@@ -780,10 +907,10 @@ DualMeshGenerator::generate()
     };
 
     const auto addTetrahedralizedPolyhedron =
-        [&](const std::vector<std::vector<Point>> & side_points) -> bool
+        [&](const std::vector<std::vector<Point>> & side_points) -> std::size_t
     {
       if (side_points.size() < 4)
-        return false;
+        return 0;
 
       const Real tol = std::max(_geometry_relative_tol, Real(1e-12));
       const Real polyhedron_scale = polyhedronScale3D(side_points);
@@ -791,11 +918,68 @@ DualMeshGenerator::generate()
       const Real volume_tol = length_tol * length_tol * length_tol;
       std::vector<std::vector<Point>> surface_triangles;
 
+      const auto formatPointList = [](const std::vector<Point> & points)
+      {
+        std::ostringstream oss;
+
+        for (const auto i : index_range(points))
+          oss << "\n        " << i << ": " << points[i];
+
+        return oss.str();
+      };
+
+      const auto formatParentPolyhedron = [&]()
+      {
+        std::ostringstream oss;
+        std::vector<Point> unique_points;
+
+        for (const auto & side : side_points)
+          for (const auto & point : side)
+            addUniquePoint(unique_points, point, length_tol);
+
+        oss << "\n  parent polyhedron unique points (" << unique_points.size()
+            << "):" << formatPointList(unique_points);
+        oss << "\n  parent polyhedron faces (" << side_points.size() << "):";
+
+        for (const auto i : index_range(side_points))
+          oss << "\n    face " << i << " (" << side_points[i].size()
+              << " points):" << formatPointList(side_points[i]);
+
+        return oss.str();
+      };
+
+      const auto formatSurfaceTriangles = [&]()
+      {
+        std::ostringstream oss;
+
+        oss << "\n  surface triangles (" << surface_triangles.size() << "):";
+
+        for (const auto i : index_range(surface_triangles))
+          oss << "\n    triangle " << i << ":" << formatPointList(surface_triangles[i]);
+
+        return oss.str();
+      };
+
+      const auto printNetgenFailure = [&](const std::string & reason, const std::string & detail)
+      {
+        if (_debug_netgen)
+          mooseInfo("DualMeshGenerator NetGen debug: ",
+                    reason,
+                    detail,
+                    formatParentPolyhedron(),
+                    formatSurfaceTriangles());
+      };
+
       const auto validSurfaceSegment = [&](const Point & point0, const Point & point1)
       { return segmentInsidePrimalBoundary(point0, point1); };
 
       if (!surfaceTriangles3D(side_points, surface_triangles, validSurfaceSegment, length_tol))
-        return false;
+      {
+        printNetgenFailure("surface triangulation failed",
+                           "\n  at least one parent face could not be fan-triangulated with "
+                           "valid primal-boundary diagonals");
+        return 0;
+      }
 
       const auto addNetgenTetrahedralizedSurface = [&]()
       {
@@ -836,7 +1020,8 @@ DualMeshGenerator::generate()
         libmesh_try { netgen.triangulate(); }
         libmesh_catch(...)
         {
-          return false;
+          printNetgenFailure("NetGen threw during triangulate()", "");
+          return std::size_t(0);
         }
 
         std::vector<std::array<Point, 4>> generated_tets;
@@ -857,13 +1042,27 @@ DualMeshGenerator::generate()
               (tet_points[0] + tet_points[1] + tet_points[2] + tet_points[3]) / 4.0;
 
           if (!pointInsidePrimalBoundary(tet_center))
-            return false;
+          {
+            std::ostringstream detail;
+
+            detail << "\n  generated tet center outside primal boundary: " << tet_center;
+            detail << "\n  generated tet points:";
+
+            for (const auto i : index_range(tet_points))
+              detail << "\n    " << i << ": " << tet_points[i];
+
+            printNetgenFailure("generated tet failed primal-boundary validation", detail.str());
+            return std::size_t(0);
+          }
 
           generated_tets.push_back(tet_points);
         }
 
         if (generated_tets.empty())
-          return false;
+        {
+          printNetgenFailure("NetGen produced no non-degenerate TET4 elements", "");
+          return std::size_t(0);
+        }
 
         std::vector<Node *> local_nodes;
 
@@ -899,26 +1098,40 @@ DualMeshGenerator::generate()
           dualMesh->add_elem(std::move(tet));
         }
 
-        return true;
+        return generated_tets.size();
 #else
-        return false;
+        printNetgenFailure("NetGen is unavailable in this libMesh build", "");
+        return std::size_t(0);
 #endif
       };
 
-      if (addNetgenTetrahedralizedSurface())
-        return true;
-
-      return false;
+      return addNetgenTetrahedralizedSurface();
     };
 
     const auto addPolyhedronOrTetrahedralize =
         [&](const std::vector<std::vector<Point>> & side_points, const bool force_tetrahedralize)
     {
       if (!force_tetrahedralize && tryAddPolyhedron(*dualMesh, side_points))
+      {
+        ++direct_polyhedron_elements;
         return;
+      }
 
-      if (!addTetrahedralizedPolyhedron(side_points))
+      const auto added_tets = addTetrahedralizedPolyhedron(side_points);
+
+      if (!added_tets)
         mooseError("Could not tetrahedralize rejected non-convex 3D dual polyhedron.");
+
+      if (force_tetrahedralize)
+      {
+        ++forced_tetrahedralized_cells;
+        forced_tetrahedralized_elements += added_tets;
+      }
+      else
+      {
+        ++fallback_tetrahedralized_cells;
+        fallback_tetrahedralized_elements += added_tets;
+      }
     };
 
     // Build one dual cell around each primal node. Concave cells are broken into TET4s using
@@ -927,7 +1140,7 @@ DualMeshGenerator::generate()
     {
       const dof_id_type source_node_id = node_elems.first;
       const Point & source_point = *input_mesh->node_ptr(source_node_id);
-      std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>> edge_to_points;
+      std::map<std::pair<dof_id_type, dof_id_type>, ConnectedFacePoints3D> edge_to_points;
       std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>>
           midpoint_boundary_face_centroids;
       std::vector<Point> boundary_face_centroids;
@@ -971,13 +1184,24 @@ DualMeshGenerator::generate()
           auto & previous_edge_points = edge_to_points[edgeKey(source_node_id, previous_node_id)];
           auto & next_edge_points = edge_to_points[edgeKey(source_node_id, next_node_id)];
 
-          addUniquePoint(previous_edge_points, elem_centroid);
-          addUniquePoint(next_edge_points, elem_centroid);
+          addConnectedFacePoint3D(previous_edge_points, elem_centroid, primal_boundary_length_tol);
+          addConnectedFacePoint3D(next_edge_points, elem_centroid, primal_boundary_length_tol);
 
-          if (elem->neighbor_ptr(side) == nullptr)
+          if (elem->neighbor_ptr(side) != nullptr)
           {
-            addUniquePoint(previous_edge_points, face_centroid);
-            addUniquePoint(next_edge_points, face_centroid);
+            const Point neighbor_centroid = elem->neighbor_ptr(side)->true_centroid();
+
+            addConnectedFaceSegment3D(
+                previous_edge_points, elem_centroid, neighbor_centroid, primal_boundary_length_tol);
+            addConnectedFaceSegment3D(
+                next_edge_points, elem_centroid, neighbor_centroid, primal_boundary_length_tol);
+          }
+          else
+          {
+            addConnectedFaceSegment3D(
+                previous_edge_points, elem_centroid, face_centroid, primal_boundary_length_tol);
+            addConnectedFaceSegment3D(
+                next_edge_points, elem_centroid, face_centroid, primal_boundary_length_tol);
             addUniquePoint(boundary_face_centroids, face_centroid);
 
             const auto previous_midpoint_it =
@@ -989,14 +1213,20 @@ DualMeshGenerator::generate()
             {
               if (previous_midpoint_it != boundary_edge_midpoints.end())
               {
-                addUniquePoint(previous_edge_points, previous_midpoint_it->second);
+                addConnectedFaceSegment3D(previous_edge_points,
+                                          face_centroid,
+                                          previous_midpoint_it->second,
+                                          primal_boundary_length_tol);
                 addUniquePoint(midpoint_boundary_face_centroids[previous_midpoint_it->first],
                                face_centroid);
               }
 
               if (next_midpoint_it != boundary_edge_midpoints.end())
               {
-                addUniquePoint(next_edge_points, next_midpoint_it->second);
+                addConnectedFaceSegment3D(next_edge_points,
+                                          face_centroid,
+                                          next_midpoint_it->second,
+                                          primal_boundary_length_tol);
                 addUniquePoint(midpoint_boundary_face_centroids[next_midpoint_it->first],
                                face_centroid);
               }
@@ -1020,14 +1250,15 @@ DualMeshGenerator::generate()
 
       for (const auto & edge_points : edge_to_points)
       {
-        if (edge_points.second.size() < 3)
+        if (edge_points.second.points.size() < 3)
           continue;
 
         const dof_id_type other_node_id = edge_points.first.first == source_node_id
                                               ? edge_points.first.second
                                               : edge_points.first.first;
         const Point edge_axis = *input_mesh->node_ptr(other_node_id) - source_point;
-        const auto sorted_edge_points = sortPointsAroundAxis3D(edge_points.second, edge_axis);
+        const auto sorted_edge_points =
+            sortConnectedFacePoints3D(edge_points.second, edge_axis, primal_boundary_length_tol);
 
         addSidePoints3D(polyhedron_side_points, sorted_edge_points);
       }
@@ -1096,6 +1327,21 @@ DualMeshGenerator::generate()
       addPolyhedronOrTetrahedralize(polyhedron_side_points,
                                     hasConcaveBoundaryNormals(source_node_id));
     }
+
+    mooseInfo("DualMeshGenerator 3D output element sources: direct C0Polyhedron / forced TET4 / "
+              "fallback TET4 / total: ",
+              direct_polyhedron_elements,
+              " / ",
+              forced_tetrahedralized_elements,
+              " / ",
+              fallback_tetrahedralized_elements,
+              " / ",
+              direct_polyhedron_elements + forced_tetrahedralized_elements +
+                  fallback_tetrahedralized_elements,
+              "\n  tetrahedralized source cells, forced / fallback: ",
+              forced_tetrahedralized_cells,
+              " / ",
+              fallback_tetrahedralized_cells);
 
     dualMesh->unset_is_prepared();
     return dynamic_pointer_cast<MeshBase>(dualMesh);

@@ -36,4 +36,7 @@ protected:
   /// Relative tolerance for geometric determinations, scaled by the primal mesh's bounding box size.
   /// For Voronoi duals, determines the size of the circumscribing square.
   Real _geometry_relative_tol;
+
+  /// Whether to print detailed diagnostics when NetGen tetrahedralization fails.
+  bool _debug_netgen;
 };
