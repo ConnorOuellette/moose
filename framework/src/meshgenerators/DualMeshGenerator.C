@@ -49,6 +49,12 @@ DualMeshGenerator::validParams()
                              dual_mesh_type,
                              "Whether to output a barycentric dual or a Voronoi dual of the "
                              "Delaunay triangulation of the primal mesh.");
+  MooseEnum concave_treatment("NetGen PolyCut", "NetGen");
+  params.addParam<MooseEnum>(
+      "concave_treatment",
+      concave_treatment,
+      "Treatment for concave 3D dual cells. NetGen tetrahedralizes the candidate polyhedron, "
+      "while PolyCut attempts to split it into convex polyhedra.");
   params.addRangeCheckedParam<Real>(
       "boundary_node_angular_tol",
       1e-8,
@@ -77,6 +83,7 @@ DualMeshGenerator::DualMeshGenerator(const InputParameters & parameters)
   : MeshGenerator(parameters),
     _input(getMesh("input")),
     _dual_mesh_type(getParam<MooseEnum>("dual_mesh_type")),
+    _concave_treatment(getParam<MooseEnum>("concave_treatment")),
     _boundary_node_angular_tol(getParam<Real>("boundary_node_angular_tol")),
     _geometry_relative_tol(getParam<Real>("geometry_relative_tol")),
     _debug_netgen(getParam<bool>("debug_netgen"))
@@ -519,6 +526,385 @@ sortConnectedFacePoints3D(const ConnectedFacePoints3D & unsorted_face_points,
   return ordered_points;
 }
 
+struct PolyCutEdge3D
+{
+  Point p0;
+  Point p1;
+};
+
+struct PolyCutResult3D
+{
+  std::vector<std::vector<Point>> child0_side_points;
+  std::vector<std::vector<Point>> child1_side_points;
+};
+
+static Point
+centroid3D(const std::vector<Point> & points)
+{
+  Point centroid;
+
+  for (const auto & point : points)
+    centroid += point;
+
+  if (!points.empty())
+    centroid /= points.size();
+
+  return centroid;
+}
+
+static Point
+polyhedronCentroid3D(const std::vector<std::vector<Point>> & side_points,
+                     const Real tol = 1e-12)
+{
+  std::vector<Point> unique_points;
+
+  for (const auto & side : side_points)
+    for (const auto & point : side)
+      addUniquePoint(unique_points, point, tol);
+
+  return centroid3D(unique_points);
+}
+
+static bool
+samePoint3D(const Point & point0, const Point & point1, const Real tol = 1e-12)
+{
+  return MooseUtils::absoluteFuzzyEqual(point0, point1, tol);
+}
+
+static bool
+sameSegment3D(const Point & point0,
+              const Point & point1,
+              const Point & other_point0,
+              const Point & other_point1,
+              const Real tol = 1e-12)
+{
+  return (samePoint3D(point0, other_point0, tol) &&
+          samePoint3D(point1, other_point1, tol)) ||
+         (samePoint3D(point0, other_point1, tol) &&
+          samePoint3D(point1, other_point0, tol));
+}
+
+static bool
+faceContainsPoint3D(const std::vector<Point> & side_points,
+                    const Point & point,
+                    const Real tol = 1e-12)
+{
+  for (const auto & side_point : side_points)
+    if (samePoint3D(side_point, point, tol))
+      return true;
+
+  return false;
+}
+
+static bool
+faceContainsEdge3D(const std::vector<Point> & side_points,
+                   const Point & point0,
+                   const Point & point1,
+                   const Real tol = 1e-12)
+{
+  if (side_points.size() < 2)
+    return false;
+
+  for (const auto i : index_range(side_points))
+    if (sameSegment3D(
+            side_points[i], side_points[(i + 1) % side_points.size()], point0, point1, tol))
+      return true;
+
+  return false;
+}
+
+static bool
+addUniqueSegment3D(std::vector<std::pair<Point, Point>> & segments,
+                   const Point & point0,
+                   const Point & point1,
+                   const Real tol = 1e-12)
+{
+  if (samePoint3D(point0, point1, tol))
+    return false;
+
+  for (const auto & segment : segments)
+    if (sameSegment3D(segment.first, segment.second, point0, point1, tol))
+      return false;
+
+  segments.push_back({point0, point1});
+  return true;
+}
+
+static bool
+findConcavePolyhedronEdge3D(const std::vector<std::vector<Point>> & side_points,
+                            const Real normal_dot_tol,
+                            const Real length_tol,
+                            PolyCutEdge3D & concave_edge)
+{
+  const Real area_tol = length_tol * length_tol;
+  const Point polyhedron_centroid = polyhedronCentroid3D(side_points, length_tol);
+  std::vector<Point> side_normals(side_points.size());
+  std::vector<Point> side_centroids(side_points.size());
+
+  for (const auto i : index_range(side_points))
+  {
+    side_centroids[i] = centroid3D(side_points[i]);
+    Point normal = faceNormal3D(side_points[i], area_tol);
+
+    if (normal.norm() <= area_tol)
+      continue;
+
+    if (normal * (side_centroids[i] - polyhedron_centroid) < 0.0)
+      normal = -1.0 * normal;
+
+    side_normals[i] = normal / normal.norm();
+  }
+
+  for (const auto i : index_range(side_points))
+    for (const auto j : make_range(i + 1, side_points.size()))
+    {
+      if (side_normals[i].norm() <= length_tol || side_normals[j].norm() <= length_tol)
+        continue;
+
+      if (side_normals[i] * side_normals[j] <= normal_dot_tol)
+        continue;
+
+      const Point centroid_delta = side_centroids[j] - side_centroids[i];
+
+      if (side_normals[i] * centroid_delta <= length_tol ||
+          side_normals[j] * (-1.0 * centroid_delta) <= length_tol)
+        continue;
+
+      for (const auto point_index : index_range(side_points[i]))
+      {
+        const Point & point0 = side_points[i][point_index];
+        const Point & point1 = side_points[i][(point_index + 1) % side_points[i].size()];
+
+        if (faceContainsEdge3D(side_points[j], point0, point1, length_tol))
+        {
+          concave_edge = {point0, point1};
+          return true;
+        }
+      }
+    }
+
+  return false;
+}
+
+static bool
+polyCutPointAssociation3D(const std::vector<std::vector<Point>> & side_points,
+                          const Point & point,
+                          const PolyCutEdge3D & concave_edge,
+                          const Real tol,
+                          unsigned int & concave_point_index)
+{
+  bool shares_point0 = false;
+  bool shares_point1 = false;
+
+  for (const auto & side : side_points)
+  {
+    if (!faceContainsPoint3D(side, point, tol))
+      continue;
+
+    const bool has_point0 = faceContainsPoint3D(side, concave_edge.p0, tol);
+    const bool has_point1 = faceContainsPoint3D(side, concave_edge.p1, tol);
+
+    if (has_point0 && has_point1)
+      return false;
+
+    shares_point0 = shares_point0 || has_point0;
+    shares_point1 = shares_point1 || has_point1;
+  }
+
+  if (shares_point0 == shares_point1)
+    return false;
+
+  concave_point_index = shares_point0 ? 0 : 1;
+  return true;
+}
+
+static std::vector<std::vector<Point>>
+polyCutFaceCandidates3D(const std::vector<std::vector<Point>> & side_points,
+                        const PolyCutEdge3D & concave_edge,
+                        const Real tol)
+{
+  std::vector<std::pair<Point, Point>> real_edges;
+  std::vector<std::vector<Point>> cut_faces;
+
+  for (const auto & side : side_points)
+    for (const auto i : index_range(side))
+      addUniqueSegment3D(real_edges, side[i], side[(i + 1) % side.size()], tol);
+
+  for (const auto & real_edge : real_edges)
+  {
+    if (sameSegment3D(
+            real_edge.first, real_edge.second, concave_edge.p0, concave_edge.p1, tol) ||
+        samePoint3D(real_edge.first, concave_edge.p0, tol) ||
+        samePoint3D(real_edge.first, concave_edge.p1, tol) ||
+        samePoint3D(real_edge.second, concave_edge.p0, tol) ||
+        samePoint3D(real_edge.second, concave_edge.p1, tol))
+      continue;
+
+    unsigned int first_association = 2;
+    unsigned int second_association = 2;
+
+    if (!polyCutPointAssociation3D(
+            side_points, real_edge.first, concave_edge, tol, first_association) ||
+        !polyCutPointAssociation3D(
+            side_points, real_edge.second, concave_edge, tol, second_association) ||
+        first_association == second_association)
+      continue;
+
+    const Point & point0_side_point =
+        first_association == 0 ? real_edge.first : real_edge.second;
+    const Point & point1_side_point =
+        first_association == 1 ? real_edge.first : real_edge.second;
+    std::vector<Point> cut_face = {
+        concave_edge.p0, concave_edge.p1, point1_side_point, point0_side_point};
+
+    if (hasNonzeroArea3D(cut_face, tol))
+      cut_faces.push_back(cut_face);
+  }
+
+  return cut_faces;
+}
+
+static void
+addClippedPoint3D(std::vector<Point> & points, const Point & point, const Real tol = 1e-12)
+{
+  if (!points.empty() && samePoint3D(points.back(), point, tol))
+    return;
+
+  points.push_back(point);
+}
+
+static void
+cleanClippedFace3D(std::vector<Point> & points, const Real tol = 1e-12)
+{
+  if (points.size() > 1 && samePoint3D(points.front(), points.back(), tol))
+    points.pop_back();
+}
+
+static std::vector<Point>
+clipFaceToHalfspace3D(const std::vector<Point> & side_points,
+                      const Point & plane_point,
+                      const Point & plane_normal,
+                      const bool keep_positive_side,
+                      const Real tol = 1e-12)
+{
+  std::vector<Point> clipped_points;
+
+  if (side_points.empty())
+    return clipped_points;
+
+  const auto signedDistance = [&](const Point & point)
+  { return plane_normal * (point - plane_point); };
+
+  const auto isInside = [&](const Real signed_distance)
+  { return keep_positive_side ? signed_distance >= -tol : signed_distance <= tol; };
+
+  for (const auto i : index_range(side_points))
+  {
+    const Point & point0 = side_points[i];
+    const Point & point1 = side_points[(i + 1) % side_points.size()];
+    const Real distance0 = signedDistance(point0);
+    const Real distance1 = signedDistance(point1);
+    const bool inside0 = isInside(distance0);
+    const bool inside1 = isInside(distance1);
+
+    if (inside0 != inside1)
+    {
+      const Real denominator = distance0 - distance1;
+
+      if (std::abs(denominator) > tol)
+      {
+        const Real t = std::max(Real(0), std::min(Real(1), distance0 / denominator));
+        addClippedPoint3D(clipped_points, point0 + t * (point1 - point0), tol);
+      }
+    }
+
+    if (inside1)
+      addClippedPoint3D(clipped_points, point1, tol);
+  }
+
+  cleanClippedFace3D(clipped_points, tol);
+  return clipped_points;
+}
+
+static void
+orientPolyhedronSidePointsOutward3D(std::vector<std::vector<Point>> & side_points,
+                                    const Real tol = 1e-12)
+{
+  const Point polyhedron_centroid = polyhedronCentroid3D(side_points, tol);
+
+  for (auto & side : side_points)
+  {
+    const Point normal = faceNormal3D(side, tol);
+
+    if (normal.norm() <= tol)
+      continue;
+
+    if (normal * (centroid3D(side) - polyhedron_centroid) < 0.0)
+      std::reverse(side.begin(), side.end());
+  }
+}
+
+static bool
+buildPolyCutChildSidePoints3D(const std::vector<std::vector<Point>> & side_points,
+                              const std::vector<Point> & cut_face,
+                              const bool keep_positive_side,
+                              const Real tol,
+                              std::vector<std::vector<Point>> & child_side_points)
+{
+  Point plane_normal = faceNormal3D(cut_face, tol);
+
+  if (plane_normal.norm() <= tol)
+    return false;
+
+  plane_normal /= plane_normal.norm();
+
+  for (const auto & side : side_points)
+  {
+    const auto clipped_side =
+        clipFaceToHalfspace3D(side, cut_face.front(), plane_normal, keep_positive_side, tol);
+
+    addSidePoints3D(child_side_points, clipped_side, tol);
+  }
+
+  std::vector<Point> oriented_cut_face = cut_face;
+  const Point cut_face_normal = faceNormal3D(oriented_cut_face, tol);
+  const Point desired_cut_normal = keep_positive_side ? -1.0 * plane_normal : plane_normal;
+
+  if (cut_face_normal * desired_cut_normal < 0.0)
+    std::reverse(oriented_cut_face.begin(), oriented_cut_face.end());
+
+  addSidePoints3D(child_side_points, oriented_cut_face, tol);
+  orientPolyhedronSidePointsOutward3D(child_side_points, tol);
+
+  return child_side_points.size() >= 4;
+}
+
+static std::vector<PolyCutResult3D>
+polyCutSidePointCandidates3D(const std::vector<std::vector<Point>> & side_points,
+                             const Real normal_dot_tol,
+                             const Real length_tol)
+{
+  std::vector<PolyCutResult3D> results;
+  PolyCutEdge3D concave_edge;
+
+  if (!findConcavePolyhedronEdge3D(side_points, normal_dot_tol, length_tol, concave_edge))
+    return results;
+
+  for (const auto & cut_face : polyCutFaceCandidates3D(side_points, concave_edge, length_tol))
+  {
+    std::vector<std::vector<Point>> child0_side_points;
+    std::vector<std::vector<Point>> child1_side_points;
+
+    if (buildPolyCutChildSidePoints3D(
+            side_points, cut_face, true, length_tol, child0_side_points) &&
+        buildPolyCutChildSidePoints3D(
+            side_points, cut_face, false, length_tol, child1_side_points))
+      results.push_back({child0_side_points, child1_side_points});
+  }
+
+  return results;
+}
+
 static Real
 polyhedronScale3D(const std::vector<std::vector<Point>> & side_points)
 {
@@ -675,6 +1061,7 @@ DualMeshGenerator::generate()
     input_mesh->find_neighbors();
 
   const bool use_voronoi = _dual_mesh_type == "voronoi";
+  const bool use_polycut = _concave_treatment == "PolyCut";
   const unsigned int mesh_dimension = input_mesh->mesh_dimension();
 
   if (mesh_dimension != 2 && mesh_dimension != 3)
@@ -803,6 +1190,8 @@ DualMeshGenerator::generate()
     std::size_t forced_tetrahedralized_elements = 0;
     std::size_t fallback_tetrahedralized_cells = 0;
     std::size_t fallback_tetrahedralized_elements = 0;
+    std::size_t polycut_cells = 0;
+    std::size_t polycut_elements = 0;
 
     const auto pointInsidePrimalBoundary = [&](const Point & point)
     {
@@ -1108,12 +1497,50 @@ DualMeshGenerator::generate()
       return addNetgenTetrahedralizedSurface();
     };
 
+    const auto addPolyCutPolyhedra =
+        [&](const std::vector<std::vector<Point>> & side_points) -> std::size_t
+    {
+      const Real tol = std::max(_geometry_relative_tol, Real(1e-12));
+      const Real polyhedron_scale = polyhedronScale3D(side_points);
+      const Real length_tol = tol * polyhedron_scale;
+
+      for (const auto & polycut_result :
+           polyCutSidePointCandidates3D(side_points, boundary_normal_dot_tol, length_tol))
+      {
+        auto validation_mesh = buildReplicatedMesh(3);
+
+        if (!tryAddPolyhedron(*validation_mesh, polycut_result.child0_side_points) ||
+            !tryAddPolyhedron(*validation_mesh, polycut_result.child1_side_points))
+          continue;
+
+        if (!tryAddPolyhedron(*dualMesh, polycut_result.child0_side_points) ||
+            !tryAddPolyhedron(*dualMesh, polycut_result.child1_side_points))
+          mooseError("Could not add PolyCut 3D dual polyhedron children.");
+
+        return 2;
+      }
+
+      return 0;
+    };
+
     const auto addPolyhedronOrTetrahedralize =
         [&](const std::vector<std::vector<Point>> & side_points, const bool force_tetrahedralize)
     {
       if (!force_tetrahedralize && tryAddPolyhedron(*dualMesh, side_points))
       {
         ++direct_polyhedron_elements;
+        return;
+      }
+
+      if (use_polycut)
+      {
+        const auto added_polyhedra = addPolyCutPolyhedra(side_points);
+
+        if (!added_polyhedra)
+          mooseError("Could not cut rejected non-convex 3D dual polyhedron.");
+
+        ++polycut_cells;
+        polycut_elements += added_polyhedra;
         return;
       }
 
@@ -1134,8 +1561,8 @@ DualMeshGenerator::generate()
       }
     };
 
-    // Build one dual cell around each primal node. Concave cells are broken into TET4s using
-    // checked interior points.
+    // Build one dual cell around each primal node. Concave cells are handled according to the
+    // selected concave treatment.
     for (const auto & node_elems : source_node_to_elems)
     {
       const dof_id_type source_node_id = node_elems.first;
@@ -1342,6 +1769,12 @@ DualMeshGenerator::generate()
               forced_tetrahedralized_cells,
               " / ",
               fallback_tetrahedralized_cells);
+
+    if (use_polycut)
+      mooseInfo("DualMeshGenerator 3D PolyCut source cells / elements: ",
+                polycut_cells,
+                " / ",
+                polycut_elements);
 
     dualMesh->unset_is_prepared();
     return dynamic_pointer_cast<MeshBase>(dualMesh);
@@ -1747,6 +2180,24 @@ DualMeshGenerator::generate()
       dualMesh->add_elem(std::move(dual_elem));
   };
 
+  const auto sortPointsAroundCentroid = [](std::vector<Point> & points)
+  {
+    Point centroid;
+
+    for (const auto & point : points)
+      centroid += point;
+
+    centroid /= points.size();
+
+    std::sort(points.begin(),
+              points.end(),
+              [&centroid](const Point & a, const Point & b)
+              {
+                return std::atan2(a(1) - centroid(1), a(0) - centroid(0)) <
+                       std::atan2(b(1) - centroid(1), b(0) - centroid(0));
+              });
+  };
+
   // Build one dual element around each source node.
   for (const auto & node_elems : source_node_to_elems)
   {
@@ -1872,6 +2323,13 @@ DualMeshGenerator::generate()
 
     if (concave_vertex_index < dual_points.size())
     {
+      if (!use_voronoi)
+      {
+        sortPointsAroundCentroid(dual_points);
+        addDualElement(dual_points);
+        continue;
+      }
+
       const Point corner_point = dual_points[concave_vertex_index];
       std::vector<std::pair<Point, Real>> sorted_points;
 

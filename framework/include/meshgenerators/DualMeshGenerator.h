@@ -29,6 +29,9 @@ protected:
   /// Determines the type of dual mesh to generate: Voronoi or barycentric.
   MooseEnum _dual_mesh_type;
 
+  /// Treatment for concave 3D dual cells.
+  MooseEnum _concave_treatment;
+
   /// Angular tolerance, in radians, for determining colinearity of boundary sides when detecting primal boundary
   /// vertices. If the sides make an angle greater than this, their shared point is considered a vertex and is added to the dual mesh.
   Real _boundary_node_angular_tol;
