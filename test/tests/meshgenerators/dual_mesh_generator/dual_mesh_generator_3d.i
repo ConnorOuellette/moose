@@ -33,17 +33,11 @@
         type = DualMeshGenerator
         input = extrude
         dual_mesh_type = barycentric
-    []
-
-    [check]
-        type = MeshDiagnosticsGenerator
-        input = myDualGen
-        examine_element_volumes = WARNING
-        examine_element_overlap = WARNING
+        concave_treatment = 'Split PolyCut NetGen'
     []
 
     [convert]
         type = ElementsToSimplicesConverter
-        input = check
+        input = SPEG
     []
 []
