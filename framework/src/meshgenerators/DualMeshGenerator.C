@@ -553,8 +553,7 @@ centroid3D(const std::vector<Point> & points)
 }
 
 static Point
-polyhedronCentroid3D(const std::vector<std::vector<Point>> & side_points,
-                     const Real tol = 1e-12)
+polyhedronCentroid3D(const std::vector<std::vector<Point>> & side_points, const Real tol = 1e-12)
 {
   std::vector<Point> unique_points;
 
@@ -578,10 +577,8 @@ sameSegment3D(const Point & point0,
               const Point & other_point1,
               const Real tol = 1e-12)
 {
-  return (samePoint3D(point0, other_point0, tol) &&
-          samePoint3D(point1, other_point1, tol)) ||
-         (samePoint3D(point0, other_point1, tol) &&
-          samePoint3D(point1, other_point0, tol));
+  return (samePoint3D(point0, other_point0, tol) && samePoint3D(point1, other_point1, tol)) ||
+         (samePoint3D(point0, other_point1, tol) && samePoint3D(point1, other_point0, tol));
 }
 
 static bool
@@ -732,8 +729,7 @@ polyCutFaceCandidates3D(const std::vector<std::vector<Point>> & side_points,
 
   for (const auto & real_edge : real_edges)
   {
-    if (sameSegment3D(
-            real_edge.first, real_edge.second, concave_edge.p0, concave_edge.p1, tol) ||
+    if (sameSegment3D(real_edge.first, real_edge.second, concave_edge.p0, concave_edge.p1, tol) ||
         samePoint3D(real_edge.first, concave_edge.p0, tol) ||
         samePoint3D(real_edge.first, concave_edge.p1, tol) ||
         samePoint3D(real_edge.second, concave_edge.p0, tol) ||
@@ -750,10 +746,8 @@ polyCutFaceCandidates3D(const std::vector<std::vector<Point>> & side_points,
         first_association == second_association)
       continue;
 
-    const Point & point0_side_point =
-        first_association == 0 ? real_edge.first : real_edge.second;
-    const Point & point1_side_point =
-        first_association == 1 ? real_edge.first : real_edge.second;
+    const Point & point0_side_point = first_association == 0 ? real_edge.first : real_edge.second;
+    const Point & point1_side_point = first_association == 1 ? real_edge.first : real_edge.second;
     std::vector<Point> cut_face = {
         concave_edge.p0, concave_edge.p1, point1_side_point, point0_side_point};
 
@@ -897,8 +891,7 @@ polyCutSidePointCandidates3D(const std::vector<std::vector<Point>> & side_points
 
     if (buildPolyCutChildSidePoints3D(
             side_points, cut_face, true, length_tol, child0_side_points) &&
-        buildPolyCutChildSidePoints3D(
-            side_points, cut_face, false, length_tol, child1_side_points))
+        buildPolyCutChildSidePoints3D(side_points, cut_face, false, length_tol, child1_side_points))
       results.push_back({child0_side_points, child1_side_points});
   }
 
@@ -2170,32 +2163,16 @@ DualMeshGenerator::generate()
     {
       auto reversed_elem = std::make_unique<libMesh::C0Polygon>(points.size());
 
-      for (const auto i : index_range(points))
-        reversed_elem->set_node(i, dualMesh->add_point(points[points.size() - 1 - i]));
+      reversed_elem->set_node(0, dualMesh->add_point(points[0]));
+
+      for (const auto i : make_range(std::size_t(1), points.size()))
+        reversed_elem->set_node(i, dualMesh->add_point(points[points.size() - i]));
 
       dual_elem = std::move(reversed_elem);
     }
 
     if (!dual_elem->is_flipped())
       dualMesh->add_elem(std::move(dual_elem));
-  };
-
-  const auto sortPointsAroundCentroid = [](std::vector<Point> & points)
-  {
-    Point centroid;
-
-    for (const auto & point : points)
-      centroid += point;
-
-    centroid /= points.size();
-
-    std::sort(points.begin(),
-              points.end(),
-              [&centroid](const Point & a, const Point & b)
-              {
-                return std::atan2(a(1) - centroid(1), a(0) - centroid(0)) <
-                       std::atan2(b(1) - centroid(1), b(0) - centroid(0));
-              });
   };
 
   // Build one dual element around each source node.
@@ -2323,13 +2300,6 @@ DualMeshGenerator::generate()
 
     if (concave_vertex_index < dual_points.size())
     {
-      if (!use_voronoi)
-      {
-        sortPointsAroundCentroid(dual_points);
-        addDualElement(dual_points);
-        continue;
-      }
-
       const Point corner_point = dual_points[concave_vertex_index];
       std::vector<std::pair<Point, Real>> sorted_points;
 
@@ -2359,11 +2329,10 @@ DualMeshGenerator::generate()
         const std::size_t next_i = (i + 1) % sorted_points.size();
         const std::size_t prev_i = (i + sorted_points.size() - 1) % sorted_points.size();
 
-        // We pick the direction of fan-triangulating concave polygons such that we never create a
-        // triangle that bridges across a boundary
+        // Pick the direction of the fan ordering so no triangle formed from the concave corner
+        // bridges across a boundary.
         if (!isBoundarySegmentPoint(sorted_points[next_i].first))
         {
-          // Now we can fan out triangles to break up otherwise concave dual elements
           for (const auto k : index_range(sorted_points))
             fan_points.push_back(sorted_points[(i + k) % sorted_points.size()].first);
 
@@ -2378,6 +2347,14 @@ DualMeshGenerator::generate()
 
           break;
         }
+      }
+
+      if (!use_voronoi)
+      {
+        if (fan_points.size() >= 3)
+          addDualElement(fan_points);
+
+        continue;
       }
 
       if (fan_points.size() >= 3)
