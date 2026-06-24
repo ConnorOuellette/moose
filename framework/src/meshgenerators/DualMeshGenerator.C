@@ -31,6 +31,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -483,7 +484,8 @@ sortPointsAroundAxis3D(const std::vector<Point> & unsorted_points,
 static std::vector<Point>
 sortConnectedFacePoints3D(const ConnectedFacePoints3D & unsorted_face_points,
                           const Point & axis,
-                          const Real tol = 1e-12)
+                          const Real tol = 1e-12,
+                          std::map<std::string, std::size_t> * fallback_counts = nullptr)
 {
   std::vector<Point> points;
 
@@ -525,9 +527,17 @@ sortConnectedFacePoints3D(const ConnectedFacePoints3D & unsorted_face_points,
     addNeighbor(point1_index, point0_index);
   }
 
+  const auto fallbackSort = [&](const std::string & reason)
+  {
+    if (fallback_counts)
+      ++(*fallback_counts)["sortConnectedFacePoints3D " + reason];
+
+    return sortPointsAroundAxis3D(points, axis, tol);
+  };
+
   for (const auto & neighbors : point_neighbors)
     if (neighbors.size() != 2)
-      return sortPointsAroundAxis3D(points, axis, tol);
+      return fallbackSort("neighbor-count fallback");
 
   std::vector<Point> ordered_points;
   std::vector<bool> visited(points.size(), false);
@@ -537,7 +547,7 @@ sortConnectedFacePoints3D(const ConnectedFacePoints3D & unsorted_face_points,
   for ([[maybe_unused]] const auto i : index_range(points))
   {
     if (visited[current_index])
-      return sortPointsAroundAxis3D(points, axis, tol);
+      return fallbackSort("revisit fallback");
 
     ordered_points.push_back(points[current_index]);
     visited[current_index] = true;
@@ -550,7 +560,7 @@ sortConnectedFacePoints3D(const ConnectedFacePoints3D & unsorted_face_points,
   }
 
   if (current_index != 0)
-    return sortPointsAroundAxis3D(points, axis, tol);
+    return fallbackSort("open-loop fallback");
 
   if (axis * faceNormal3D(ordered_points) < 0.0)
     std::reverse(ordered_points.begin(), ordered_points.end());
@@ -618,6 +628,9 @@ polyhedronCentroid3D(const std::vector<std::vector<Point>> & side_points, const 
 
   return centroid3D(unique_points);
 }
+
+/* There are a lot of boolean-returning methods here: They are used to distinguish boundary
+ * treatments, and all return differently depending on the geometry an input mesh may have.*/
 
 static bool
 samePoint3D(const Point & point0, const Point & point1, const Real tol = 1e-12)
@@ -739,34 +752,158 @@ insertSplitPointsOnSideEdges3D(std::vector<std::vector<Point>> & side_points,
   if (split_edge_points.empty() && face_replacements.empty())
     return;
 
+  using RoundedPointKey3D = std::array<long long, 3>;
+  using RoundedSegmentKey3D = std::pair<RoundedPointKey3D, RoundedPointKey3D>;
+
+  const Real key_tol = std::max(tol, Real(1e-12));
+
+  const auto roundedPointKey = [&](const Point & point)
+  {
+    return RoundedPointKey3D{{static_cast<long long>(std::llround(point(0) / key_tol)),
+                              static_cast<long long>(std::llround(point(1) / key_tol)),
+                              static_cast<long long>(std::llround(point(2) / key_tol))}};
+  };
+
+  const auto roundedSegmentKey = [&](const Point & point0, const Point & point1)
+  {
+    auto key0 = roundedPointKey(point0);
+    auto key1 = roundedPointKey(point1);
+
+    if (key1 < key0)
+      std::swap(key0, key1);
+
+    return RoundedSegmentKey3D{key0, key1};
+  };
+
+  std::map<RoundedPointKey3D, std::vector<const SplitEdgePoint3D *>> split_edge_point_index;
+  std::map<RoundedPointKey3D, std::vector<const SplitFaceReplacement3D *>> face_replacement_index;
+  std::map<RoundedSegmentKey3D, std::vector<const SplitEdgePoint3D *>> split_edge_segment_index;
+
+  const auto addSplitEdgePointCandidate = [](std::vector<const SplitEdgePoint3D *> & candidates,
+                                             const SplitEdgePoint3D * split_edge_point)
+  {
+    for (const auto * const candidate : candidates)
+      if (candidate == split_edge_point)
+        return;
+
+    candidates.push_back(split_edge_point);
+  };
+
+  const auto addFaceReplacementCandidate =
+      [](std::vector<const SplitFaceReplacement3D *> & candidates,
+         const SplitFaceReplacement3D * face_replacement)
+  {
+    for (const auto * const candidate : candidates)
+      if (candidate == face_replacement)
+        return;
+
+    candidates.push_back(face_replacement);
+  };
+
+  for (const auto & split_edge_point : split_edge_points)
+    addSplitEdgePointCandidate(split_edge_segment_index[roundedSegmentKey(
+                                   split_edge_point.edge_point0, split_edge_point.edge_point1)],
+                               &split_edge_point);
+
+  for (const auto & split_edge_segment : split_edge_segment_index)
+    for (const auto * const split_edge_point : split_edge_segment.second)
+    {
+      addSplitEdgePointCandidate(
+          split_edge_point_index[roundedPointKey(split_edge_point->edge_point0)], split_edge_point);
+      addSplitEdgePointCandidate(
+          split_edge_point_index[roundedPointKey(split_edge_point->edge_point1)], split_edge_point);
+
+      for (const auto * const source_edge_split_point : split_edge_segment.second)
+        addSplitEdgePointCandidate(
+            split_edge_point_index[roundedPointKey(source_edge_split_point->split_point)],
+            split_edge_point);
+    }
+
+  for (const auto & face_replacement : face_replacements)
+    for (const auto & point : face_replacement.original_face_points)
+      addFaceReplacementCandidate(face_replacement_index[roundedPointKey(point)],
+                                  &face_replacement);
+
+  const auto appendSplitEdgePointCandidates =
+      [&](const Point & point, std::vector<const SplitEdgePoint3D *> & candidates)
+  {
+    const auto point_key = roundedPointKey(point);
+
+    for (const auto dx : {-1, 0, 1})
+      for (const auto dy : {-1, 0, 1})
+        for (const auto dz : {-1, 0, 1})
+        {
+          const RoundedPointKey3D neighbor_key{
+              {point_key[0] + dx, point_key[1] + dy, point_key[2] + dz}};
+          const auto index_it = split_edge_point_index.find(neighbor_key);
+
+          if (index_it == split_edge_point_index.end())
+            continue;
+
+          for (const auto * const split_edge_point : index_it->second)
+            addSplitEdgePointCandidate(candidates, split_edge_point);
+        }
+  };
+
+  const auto appendFaceReplacementCandidates =
+      [&](const Point & point, std::vector<const SplitFaceReplacement3D *> & candidates)
+  {
+    const auto point_key = roundedPointKey(point);
+
+    for (const auto dx : {-1, 0, 1})
+      for (const auto dy : {-1, 0, 1})
+        for (const auto dz : {-1, 0, 1})
+        {
+          const RoundedPointKey3D neighbor_key{
+              {point_key[0] + dx, point_key[1] + dy, point_key[2] + dz}};
+          const auto index_it = face_replacement_index.find(neighbor_key);
+
+          if (index_it == face_replacement_index.end())
+            continue;
+
+          for (const auto * const face_replacement : index_it->second)
+            addFaceReplacementCandidate(candidates, face_replacement);
+        }
+  };
+
   std::vector<std::vector<Point>> split_side_points;
   split_side_points.reserve(side_points.size());
 
   for (const auto & side : side_points)
   {
-    const Point side_normal = faceNormal3D(side, tol);
     bool replaced_side = false;
 
-    for (const auto & face_replacement : face_replacements)
-      if (samePointSet3D(side, face_replacement.original_face_points, tol))
-      {
-        addSidePoints3D(
-            split_side_points,
-            orientedSplitFacePart3D(face_replacement.child0_face_points, side_normal, tol),
-            tol);
-        addSidePoints3D(
-            split_side_points,
-            orientedSplitFacePart3D(face_replacement.child1_face_points, side_normal, tol),
-            tol);
-        replaced_side = true;
-        break;
-      }
+    if (side.size() == 4 && !face_replacements.empty())
+    {
+      std::vector<const SplitFaceReplacement3D *> candidate_face_replacements;
+
+      for (const auto & point : side)
+        appendFaceReplacementCandidates(point, candidate_face_replacements);
+
+      for (const auto * const face_replacement : candidate_face_replacements)
+        if (samePointSet3D(side, face_replacement->original_face_points, tol))
+        {
+          const Point side_normal = faceNormal3D(side, tol);
+
+          addSidePoints3D(
+              split_side_points,
+              orientedSplitFacePart3D(face_replacement->child0_face_points, side_normal, tol),
+              tol);
+          addSidePoints3D(
+              split_side_points,
+              orientedSplitFacePart3D(face_replacement->child1_face_points, side_normal, tol),
+              tol);
+          replaced_side = true;
+          break;
+        }
+    }
 
     if (replaced_side)
       continue;
 
     std::vector<Point> split_side;
     std::vector<std::size_t> inserted_split_point_indices;
+    split_side.reserve(side.size());
 
     const auto addOrderedPoint = [&](const Point & point)
     {
@@ -799,31 +936,36 @@ insertSplitPointsOnSideEdges3D(std::vector<std::vector<Point>> & side_points,
         continue;
 
       std::vector<std::pair<Real, Point>> edge_split_points;
+      std::vector<const SplitEdgePoint3D *> candidate_split_edge_points;
 
-      for (const auto & split_edge_point : split_edge_points)
+      appendSplitEdgePointCandidates(point0, candidate_split_edge_points);
+      appendSplitEdgePointCandidates(point1, candidate_split_edge_points);
+
+      for (const auto * const split_edge_point : candidate_split_edge_points)
       {
-        if (samePoint3D(split_edge_point.split_point, point0, tol) ||
-            samePoint3D(split_edge_point.split_point, point1, tol) ||
-            !pointOnSegment3D(split_edge_point.split_point, point0, point1, tol))
+        if (samePoint3D(split_edge_point->split_point, point0, tol) ||
+            samePoint3D(split_edge_point->split_point, point1, tol) ||
+            !pointOnSegment3D(split_edge_point->split_point, point0, point1, tol))
           continue;
 
-        const Real parameter = ((split_edge_point.split_point - point0) * edge) / edge_length_sq;
+        const Real parameter = ((split_edge_point->split_point - point0) * edge) / edge_length_sq;
         bool already_added = false;
 
         for (const auto & edge_split_point : edge_split_points)
-          if (samePoint3D(edge_split_point.second, split_edge_point.split_point, tol))
+          if (samePoint3D(edge_split_point.second, split_edge_point->split_point, tol))
           {
             already_added = true;
             break;
           }
 
         if (!already_added)
-          edge_split_points.push_back({parameter, split_edge_point.split_point});
+          edge_split_points.push_back({parameter, split_edge_point->split_point});
       }
 
-      std::sort(edge_split_points.begin(),
-                edge_split_points.end(),
-                [](const auto & a, const auto & b) { return a.first < b.first; });
+      if (edge_split_points.size() > 1)
+        std::sort(edge_split_points.begin(),
+                  edge_split_points.end(),
+                  [](const auto & a, const auto & b) { return a.first < b.first; });
 
       for (const auto & edge_split_point : edge_split_points)
       {
@@ -1560,6 +1702,26 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
   const Real primal_boundary_length_tol =
       std::max(_geometry_relative_tol, Real(1e-12)) * mesh_scale;
 
+  std::map<std::string, std::size_t> fallback_counts;
+  bool fallback_counts_printed = false;
+
+  const auto recordFallback = [&](const std::string & label) { ++fallback_counts[label]; };
+
+  const auto printFallbackCounts = [&]()
+  {
+    if (fallback_counts_printed || fallback_counts.empty())
+      return;
+
+    fallback_counts_printed = true;
+    std::ostringstream message;
+    message << "DualMeshGenerator 3D fallback counters:";
+
+    for (const auto & count : fallback_counts)
+      message << "\n  " << count.first << ": " << count.second;
+
+    mooseInfo(message.str());
+  };
+
   std::unordered_map<dof_id_type, std::vector<BoundaryFaceNormal3D>> boundary_node_normals;
   std::map<std::pair<dof_id_type, dof_id_type>, std::vector<Point>> boundary_edge_normals;
   std::vector<std::vector<Point>> primal_boundary_surface_triangles;
@@ -1722,7 +1884,10 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
                                     const std::vector<std::vector<Point>> & side_points) -> bool
   {
     if (side_points.size() < 4)
+    {
+      recordFallback("tryAddPolyhedron rejected: fewer than four sides");
       return false;
+    }
 
     std::vector<Node *> local_nodes;
     std::vector<std::shared_ptr<libMesh::Polygon>> sides;
@@ -1764,11 +1929,13 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
     libmesh_catch(const libMesh::NotImplemented &)
     {
       deleteLocalNodes();
+      recordFallback("tryAddPolyhedron rejected: NotImplemented");
       return false;
     }
     libmesh_catch(const libMesh::LogicError &)
     {
       deleteLocalNodes();
+      recordFallback("tryAddPolyhedron rejected: LogicError");
       return false;
     }
 
@@ -1796,7 +1963,10 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
     { return segmentInsidePrimalBoundary(point0, point1); };
 
     if (!surfaceTriangles3D(side_points, surface_triangles, validSurfaceSegment, length_tol))
+    {
+      recordFallback("NetGen fallback rejected: surface triangulation failed");
       return 0;
+    }
 
     const auto addNetgenTetrahedralizedSurface = [&]()
     {
@@ -1835,7 +2005,11 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
       netgen.desired_volume() = netgen_desired_volume;
 
       libmesh_try { netgen.triangulate(); }
-      libmesh_catch(...) { return std::size_t(0); }
+      libmesh_catch(...)
+      {
+        recordFallback("NetGen fallback rejected: triangulate exception");
+        return std::size_t(0);
+      }
 
       std::vector<std::array<Point, 4>> generated_tets;
 
@@ -1855,13 +2029,19 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
             (tet_points[0] + tet_points[1] + tet_points[2] + tet_points[3]) / 4.0;
 
         if (!pointInsidePrimalBoundary(tet_center))
+        {
+          recordFallback("NetGen fallback rejected: generated tet outside primal boundary");
           return std::size_t(0);
+        }
 
         generated_tets.push_back(tet_points);
       }
 
       if (generated_tets.empty())
+      {
+        recordFallback("NetGen fallback rejected: no generated tets");
         return std::size_t(0);
+      }
 
       std::vector<Node *> local_nodes;
 
@@ -1897,8 +2077,10 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
         dualMesh->add_elem(std::move(tet));
       }
 
+      recordFallback("NetGen fallback accepted");
       return generated_tets.size();
 #else
+      recordFallback("NetGen fallback unavailable");
       return std::size_t(0);
 #endif
     };
@@ -1915,18 +2097,28 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
     const auto polycut_candidates =
         polyCutSidePointCandidates3D(side_points, boundary_normal_dot_tol, length_tol);
 
+    if (polycut_candidates.empty())
+      recordFallback("PolyCut fallback rejected: no candidates");
+
     for (const auto & polycut_result : polycut_candidates)
     {
       auto validation_mesh = buildReplicatedMesh(3);
 
       if (!tryAddPolyhedron(*validation_mesh, polycut_result.child0_side_points) ||
           !tryAddPolyhedron(*validation_mesh, polycut_result.child1_side_points))
+      {
+        recordFallback("PolyCut fallback rejected: child validation failed");
         continue;
+      }
 
       if (!tryAddPolyhedron(*dualMesh, polycut_result.child0_side_points) ||
           !tryAddPolyhedron(*dualMesh, polycut_result.child1_side_points))
+      {
+        printFallbackCounts();
         mooseError("Could not add PolyCut 3D dual polyhedron children.");
+      }
 
+      recordFallback("PolyCut fallback accepted");
       return 2;
     }
 
@@ -1946,12 +2138,19 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
             const std::vector<std::vector<Point>> & child1_side_points)
     {
       if (child0_side_points.empty() || child1_side_points.empty())
+      {
+        recordFallback("Split fallback rejected: empty child");
         return false;
+      }
 
       if (!tryAddPolyhedron(*dualMesh, child0_side_points) ||
           !tryAddPolyhedron(*dualMesh, child1_side_points))
+      {
+        printFallbackCounts();
         mooseError("Could not add Split 3D dual polyhedron children.");
+      }
 
+      recordFallback("Split fallback accepted");
       return true;
     };
 
@@ -1965,13 +2164,19 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
           side_points, split_candidate.cut_face, false, length_tol, child1_side_points);
 
       if (!child0_built || !child1_built)
+      {
+        recordFallback("Split fallback rejected: child build failed");
         return false;
+      }
 
       auto validation_mesh = buildReplicatedMesh(3);
 
       if (!tryAddPolyhedron(*validation_mesh, child0_side_points) ||
           !tryAddPolyhedron(*validation_mesh, child1_side_points))
+      {
+        recordFallback("Split fallback rejected: child validation failed");
         return false;
+      }
 
       return addSplitChildPolyhedra(child0_side_points, child1_side_points);
     };
@@ -1991,7 +2196,10 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
 
     if (!findConcavePolyhedronEdge3D(
             side_points, boundary_normal_dot_tol, length_tol, concave_edge))
+    {
+      recordFallback("Split fallback rejected: no concave edge");
       return 0;
+    }
 
     const auto split_candidates = splitCutFaceCandidates3D(side_points, concave_edge, length_tol);
 
@@ -2031,9 +2239,11 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
       split_plan = split_candidate;
       split_plan.child0_side_points = std::move(child0_side_points);
       split_plan.child1_side_points = std::move(child1_side_points);
+      recordFallback("Split plan found");
       return true;
     }
 
+    recordFallback("Split plan not found");
     return false;
   };
 
@@ -2041,31 +2251,85 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
       [&](const std::vector<std::vector<Point>> & direct_netgen_side_points,
           const std::vector<std::vector<Point>> & polycut_side_points,
           const bool force_tetrahedralize,
+          const bool searched_concave_edge,
+          const bool has_concave_edge,
           const SplitCutFaceCandidate3D * split_plan = nullptr)
   {
-    if (!force_tetrahedralize && !split_plan &&
-        tryAddPolyhedron(*dualMesh, direct_netgen_side_points))
-      return;
+    const bool concave_edge_search_failed =
+        searched_concave_edge && !has_concave_edge && !split_plan;
 
-    if (use_split && !force_tetrahedralize && !split_plan &&
-        tryAddPolyhedron(*dualMesh, polycut_side_points))
-      return;
+    if (!force_tetrahedralize && !has_concave_edge && !split_plan)
+    {
+      if (tryAddPolyhedron(*dualMesh, direct_netgen_side_points))
+        return;
+
+      recordFallback("direct C0 rejected");
+    }
+
+    if (use_split && !force_tetrahedralize && !has_concave_edge && !split_plan)
+    {
+      recordFallback("alternate direct C0 attempted");
+
+      if (tryAddPolyhedron(*dualMesh, polycut_side_points))
+      {
+        recordFallback("alternate direct C0 accepted");
+        return;
+      }
+
+      recordFallback("alternate direct C0 rejected");
+    }
 
     for (const auto & concave_treatment : _concave_treatment)
       if (concave_treatment == "Split")
       {
+        if (concave_edge_search_failed)
+        {
+          recordFallback("Split fallback skipped: no concave edge");
+          continue;
+        }
+
+        recordFallback("Split fallback attempted");
+
         if (addSplitPolyhedra(polycut_side_points, split_plan))
+        {
+          recordFallback("Split fallback resolved cell");
           return;
+        }
+
+        recordFallback("Split fallback failed cell");
       }
       else if (concave_treatment == "PolyCut")
       {
-        if (addPolyCutPolyhedra(polycut_side_points))
-          return;
-      }
-      else if (concave_treatment == "NetGen" &&
-               addTetrahedralizedPolyhedron(direct_netgen_side_points))
-        return;
+        if (concave_edge_search_failed)
+        {
+          recordFallback("PolyCut fallback skipped: no concave edge");
+          continue;
+        }
 
+        recordFallback("PolyCut fallback attempted");
+
+        if (addPolyCutPolyhedra(polycut_side_points))
+        {
+          recordFallback("PolyCut fallback resolved cell");
+          return;
+        }
+
+        recordFallback("PolyCut fallback failed cell");
+      }
+      else if (concave_treatment == "NetGen")
+      {
+        recordFallback("NetGen fallback attempted");
+
+        if (addTetrahedralizedPolyhedron(direct_netgen_side_points))
+        {
+          recordFallback("NetGen fallback resolved cell");
+          return;
+        }
+
+        recordFallback("NetGen fallback failed cell");
+      }
+
+    printFallbackCounts();
     mooseError("Could not resolve rejected non-convex 3D dual polyhedron.");
   };
 
@@ -2362,8 +2626,8 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
                                             ? edge_points.first.second
                                             : edge_points.first.first;
       const Point edge_axis = *input_mesh->node_ptr(other_node_id) - source_point;
-      const auto sorted_edge_points =
-          sortConnectedFacePoints3D(edge_points.second, edge_axis, primal_boundary_length_tol);
+      const auto sorted_edge_points = sortConnectedFacePoints3D(
+          edge_points.second, edge_axis, primal_boundary_length_tol, &fallback_counts);
 
       addSidePoints3D(direct_netgen_side_points, sorted_edge_points);
       addSidePoints3D(polycut_side_points, sorted_edge_points);
@@ -2397,7 +2661,7 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
     {
       const Point boundary_axis = boundary_normal.norm() > 1e-12 ? boundary_normal : source_point;
       const auto sorted_boundary_points = sortConnectedFacePoints3D(
-          boundary_face_points, boundary_axis, primal_boundary_length_tol);
+          boundary_face_points, boundary_axis, primal_boundary_length_tol, &fallback_counts);
 
       const auto boundaryFaceWasSplit = [&](const Point & point0, const Point & point1)
       {
@@ -2461,7 +2725,8 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
       addSidePoints3D(polycut_side_points,
                       sortConnectedFacePoints3D(boundary_plane_face.face_points,
                                                 boundary_plane_face.normal,
-                                                primal_boundary_length_tol),
+                                                primal_boundary_length_tol,
+                                                &fallback_counts),
                       primal_boundary_length_tol);
     }
 
@@ -2470,7 +2735,8 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
 
     const bool has_concave_boundary_normals = hasConcaveBoundaryNormals(source_node_id);
     PolyCutEdge3D concave_edge;
-    const bool has_concave_edge = (use_split || has_concave_boundary_normals) && [&]()
+    const bool searched_concave_edge = use_split || has_concave_boundary_normals;
+    const bool has_concave_edge = searched_concave_edge && [&]()
     {
       const Real tol = std::max(_geometry_relative_tol, Real(1e-12));
       const Real polyhedron_scale = polyhedronScale3D(polycut_side_points);
@@ -2491,8 +2757,11 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
                                              false,
                                              {}});
     else
-      addPolyhedronOrTetrahedralize(
-          direct_netgen_side_points, polycut_side_points, force_tetrahedralize);
+      addPolyhedronOrTetrahedralize(direct_netgen_side_points,
+                                    polycut_side_points,
+                                    force_tetrahedralize,
+                                    searched_concave_edge,
+                                    has_concave_edge);
   }
 
   if (use_split)
@@ -2503,24 +2772,6 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
     for (auto & split_dual_cell_side_point : split_dual_cell_side_points)
     {
       if (!split_dual_cell_side_point.has_concave_edge)
-        continue;
-
-      const bool can_add_directly = [&]()
-      {
-        auto direct_netgen_validation_mesh = buildReplicatedMesh(3);
-
-        if (tryAddPolyhedron(*direct_netgen_validation_mesh,
-                             split_dual_cell_side_point.direct_netgen_side_points))
-          return true;
-
-        auto polycut_validation_mesh = buildReplicatedMesh(3);
-
-        return tryAddPolyhedron(*polycut_validation_mesh,
-                                split_dual_cell_side_point.polycut_side_points);
-      }();
-      const bool needs_split = split_dual_cell_side_point.force_tetrahedralize || !can_add_directly;
-
-      if (!needs_split)
         continue;
 
       if (findValidSplitPlan(split_dual_cell_side_point.polycut_side_points,
@@ -2567,11 +2818,15 @@ DualMeshGenerator::generate3D(std::unique_ptr<MeshBase> input_mesh)
       addPolyhedronOrTetrahedralize(split_dual_cell_side_point.direct_netgen_side_points,
                                     split_dual_cell_side_point.polycut_side_points,
                                     split_dual_cell_side_point.force_tetrahedralize,
+                                    true,
+                                    split_dual_cell_side_point.has_concave_edge,
                                     split_dual_cell_side_point.has_split_plan
                                         ? &split_dual_cell_side_point.split_plan
                                         : nullptr);
     }
   }
+
+  printFallbackCounts();
 
   dualMesh->unset_is_prepared();
   return dynamic_pointer_cast<MeshBase>(dualMesh);
