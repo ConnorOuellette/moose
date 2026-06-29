@@ -33,11 +33,11 @@
         type = DualMeshGenerator
         input = extrude
         dual_mesh_type = barycentric
-        concave_treatment = 'Split PolyCut NetGen'
+        concave_treatment = 'split polycut netgen'
     []
 
     [convert]
         type = ElementsToSimplicesConverter
-        input = SPEG
+        input = myDualGen
     []
 []
